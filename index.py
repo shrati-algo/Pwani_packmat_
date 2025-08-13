@@ -19,7 +19,7 @@ processing_status = {
     "camera_id": None
 }
 processing_thread = None
-stop_processing = False  # A flag to stop processing gracefully
+stop_processing = False  # Flag to stop processing
 
 @app.route("/process_packmat", methods=["POST"])
 def process_video_and_generate_output():
@@ -87,26 +87,17 @@ def process_video_and_generate_output():
             save_video_log(truck_visit_id, output_path, count)
 
             mark_video_as_processed(recorded_video_path)
-            processing_status["status"] = "end"
+            processing_status["status"] = "completed"
 
         processing_thread = threading.Thread(target=run_processor)
         processing_thread.start()
 
-        processing_thread.join()  # Wait for the thread to complete
-
-        if processing_status["status"] == "end":
-            return jsonify({
-                "status": "completed",
-                "message": f"Processing completed for camera ID {camera_id}",
-                "camera_id": camera_id,
-                "object_count": processing_status["count"],
-                "output_path": processing_status["output_path"]
-            }), 200
-        else:
-            return jsonify({
-                "status": "error",
-                "message": f"Processing failed for camera ID {camera_id}"
-            }), 500
+        # Immediately return response without waiting for the background task to finish
+        return jsonify({
+            "status": "started",
+            "message": "Processing started in the background.",
+            "camera_id": camera_id
+        }), 200
 
     except Exception as e:
         return jsonify({
@@ -117,21 +108,27 @@ def process_video_and_generate_output():
 
 @app.route("/process_packmat_end", methods=["POST"])
 def stop_and_return_count():
-    global processor_instance, processing_thread, stop_processing
+    global processing_status
 
-    stop_processing = True  # Set the flag to stop processing
-
-    if processor_instance:
-        processor_instance.stop_model_processing()  # Assuming you have a stop method in VideoProcessor
-
-    if processing_thread and processing_thread.is_alive():
-        processing_thread.join()  # Wait for the thread to complete
-
-    return jsonify({
-        "status": "end",
-        "message": "Processing stopped by request.",
-        "object_count": processing_status["count"]
-    }), 200
+    if processing_status["status"] == "completed":
+        return jsonify({
+            "status": "completed",
+            "message": "Processing completed.",
+            "object_count": processing_status["count"],
+            "output_path": processing_status["output_path"]
+        }), 200
+    elif processing_status["status"] == "running":
+        return jsonify({
+            "status": "running",
+            "message": "Processing is still running.",
+            "object_count": processing_status["count"]
+        }), 200
+    else:
+        return jsonify({
+            "status": "idle",
+            "message": "No processing is currently running.",
+            "object_count": processing_status["count"]
+        }), 200
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@ import numpy as np
 import os
 from ultralytics import YOLO
 from datetime import datetime
-
+import torch
+import time
 
 # IOU calculation
 def iou(b1, b2):
@@ -54,8 +55,7 @@ class ObjectTracker:
                     best_iou = current_iou
                     best_id = obj_id
 
-            cy = (bbox[1] + bbox[3]) // 2  # object center Y
-
+            cy = (bbox[1] + bbox[3]) // 2
             print(f"[TRACKING] Object center Y: {cy}, Line Y: {line_y}")
 
             if best_id is not None:
@@ -97,14 +97,20 @@ class ObjectTracker:
 class VideoProcessor:
     def __init__(self, video_path, model_path=r"packmat_i2.pt", camera_id=0):
         self.cap = cv2.VideoCapture(video_path)
-        self.model = YOLO(model_path)
-        self.camera_id = camera_id
 
+        # Auto-detect GPU or CPU
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[INFO] Using device: {self.device}")
+
+        # Load YOLO model to the correct device
+        self.model = YOLO(model_path).to(self.device)
+
+        self.camera_id = camera_id
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
 
-        # Set line dynamically at 75% of frame height
+        # Counting line at 75% height
         self.line_y = int(self.frame_height * 0.75)
         self.line_start = (0, self.line_y)
         self.line_end = (self.frame_width, self.line_y)
@@ -132,9 +138,17 @@ class VideoProcessor:
                 print("Stream ended or interrupted.")
                 break
 
-            results = self.model(frame, conf=0.25)[0]
-            detections = []
+            # Resize frame to 640x640 for inference
+            resized_frame = cv2.resize(frame, (640, 640))
 
+            # Measure inference time
+            start_time = time.time()
+            results = self.model(resized_frame, conf=0.25)[0]
+            end_time = time.time()
+
+            print(f"[INFO] Inference time: {(end_time - start_time) * 1000:.2f} ms")
+
+            detections = []
             for box in results.boxes:
                 cls_id = int(box.cls[0])
                 label = self.model.names[cls_id]
@@ -145,11 +159,10 @@ class VideoProcessor:
 
             detections = apply_nms(detections, iou_thresh=0.5)
 
-            # Draw counting line
+            # Draw counting line on original frame
             cv2.line(frame, self.line_start, self.line_end, (0, 0, 255), 2)
-            #cv2.putText(frame, "COUNTING LINE", (self.line_start[0] + 10, self.line_y - 10),
-                        #cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # Update tracker and counter
             self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
 
             for obj_id, data in self.tracker.tracks.items():
@@ -163,33 +176,16 @@ class VideoProcessor:
                 cv2.putText(frame, label_text, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            # Smaller counter display
+            # Display counter
             cv2.putText(frame, f"Counter: {self.counter}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
             self.out.write(frame)
 
         self.cleanup()
+        torch.cuda.empty_cache()
         return self.counter
 
     def cleanup(self):
         self.cap.release()
         self.out.release()
-
-
-# # Standalone usage
-# if __name__ == "__main__":
-#     try:
-#         rtsp_link = get_next_video()
-#         if not rtsp_link:
-#             raise ValueError("RTSP link not found.")
-
-#         print(f"Processing RTSP stream from: {rtsp_link}")
-#         processor = VideoProcessor(video_path=rtsp_link, camera_id=1)
-#         count = processor.process_video()
-#         print(f"Total objects counted: {count}")
-#         print(f"Output video saved to: {processor.output_path}")
-
-#     except Exception as e:
-#         print(f"[ERROR] {str(e)}")
-
