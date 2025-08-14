@@ -41,15 +41,17 @@ def get_rtsp_link(camera_id):
         raise e
 
 
-if __name__ == "__main__":
-    try:
-        camera_id = int(input("Enter camera ID: "))
-        rtsp_link = get_rtsp_link(camera_id)
-        print(f"RTSP Link for camera ID {camera_id}: {rtsp_link}")
+# if __name__ == "__main__":
+#     try:
+#         camera_id = int(input("Enter camera ID: "))
+#         rtsp_link = get_rtsp_link(camera_id)
+#         print(f"RTSP Link for camera ID {camera_id}: {rtsp_link}")
 
-    except ValueError as ve:
-        print(f"[ERROR] {ve}")
-    except ConnectionError as ce:
-        print(f"[ERROR] {ce}")
-    except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
+#     except ValueError as ve:
+#         print(f"[ERROR] {ve}")
+#     except ConnectionError as ce:
+#         print(f"[ERROR] {ce}")
+#     except Exception as e:
+#         print(f"[ERROR] Unexpected error: {e}")
+
+# print(get_rtsp_link(4))
