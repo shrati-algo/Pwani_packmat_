@@ -1,26 +1,23 @@
 import cv2
 import numpy as np
 import os
+import torch
 from ultralytics import YOLO
 from datetime import datetime
-import torch
 import time
 
 # IOU calculation
 def iou(b1, b2):
     x1, y1, x2, y2 = b1
     x1_p, y1_p, x2_p, y2_p = b2
-
     xi1 = max(x1, x1_p)
     yi1 = max(y1, y1_p)
     xi2 = min(x2, x2_p)
     yi2 = min(y2, y2_p)
-
     inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
     b1_area = (x2 - x1) * (y2 - y1)
     b2_area = (x2_p - x1_p) * (y2_p - y1_p)
     union_area = b1_area + b2_area - inter_area
-
     return inter_area / union_area if union_area != 0 else 0
 
 # NMS
@@ -66,13 +63,11 @@ class ObjectTracker:
                     'last_y': cy,
                     'missed': 0
                 }
-
                 if best_id not in self.counted_ids:
                     last_y = self.tracks[best_id]['last_y']
                     if last_y < line_y and cy >= line_y:
                         counter += 1
                         self.counted_ids.add(best_id)
-
                 used_ids.add(best_id)
             else:
                 updated_tracks[self.next_id] = {
@@ -97,56 +92,53 @@ class ObjectTracker:
 class VideoProcessor:
     def __init__(self, video_path, model_path=r"packmat_i2.pt", camera_id=0):
         self.cap = cv2.VideoCapture(video_path)
-
-        # Auto-detect GPU or CPU
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[INFO] Using device: {self.device}")
-
-        # Load YOLO model to the correct device
-        self.model = YOLO(model_path).to(self.device)
-
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[INFO] Using device: {device.upper()}")
+        self.model = YOLO(model_path).to(device)
+        self.device = device
         self.camera_id = camera_id
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
 
-        # Counting line at 75% height
-        self.line_y = int(self.frame_height * 0.75)
+        # Adjust counting line for 640 height
+        self.line_y = int(640 * 0.75)
         self.line_start = (0, self.line_y)
-        self.line_end = (self.frame_width, self.line_y)
+        self.line_end = (640, self.line_y)
 
-        print(f"[INFO] Frame size: {self.frame_width}x{self.frame_height}, Line Y: {self.line_y}")
+        print(f"[INFO] Original Frame size: {self.frame_width}x{self.frame_height}")
+        print(f"[INFO] Resized Frame size: 640x640, Line Y: {self.line_y}")
 
         self.counter = 0
         self.tracker = ObjectTracker()
 
-        # Output video writer
         os.makedirs("outputs", exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_filename = f"cam_{self.camera_id}_{timestamp}_output.mp4"
+        output_filename = f"cam_{self.camera_id}_{timestamp}_output.avi"
         self.output_path = os.path.join("outputs", output_filename)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (self.frame_width, self.frame_height))
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (640, 640))
 
-    def process_video(self):
+    def process_video(self, stop_flag=None):
         if not self.cap.isOpened():
             raise ValueError("Error: Could not open video stream.")
 
         while True:
+            if stop_flag and stop_flag():
+                print("[INFO] Processing stopped by user.")
+                break
+
             ret, frame = self.cap.read()
             if not ret:
                 print("Stream ended or interrupted.")
                 break
 
-            # Resize frame to 640x640 for inference
-            resized_frame = cv2.resize(frame, (640, 640))
+            # Resize frame to 640x640
+            frame_resized = cv2.resize(frame, (640, 640))
 
-            # Measure inference time
             start_time = time.time()
-            results = self.model(resized_frame, conf=0.25)[0]
-            end_time = time.time()
-
-            print(f"[INFO] Inference time: {(end_time - start_time) * 1000:.2f} ms")
+            results = self.model(frame_resized, conf=0.25, verbose=False, device=self.device)[0]
+            inference_time = (time.time() - start_time) * 1000
 
             detections = []
             for box in results.boxes:
@@ -158,12 +150,12 @@ class VideoProcessor:
                     detections.append(((x1, y1, x2, y2), label, conf))
 
             detections = apply_nms(detections, iou_thresh=0.5)
+            cv2.line(frame_resized, self.line_start, self.line_end, (0, 0, 255), 2)
 
-            # Draw counting line on original frame
-            cv2.line(frame, self.line_start, self.line_end, (0, 0, 255), 2)
-
-            # Update tracker and counter
             self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
+
+            # Print both inference time and updated count
+            print(f"[GPU] Inference time: {inference_time:.2f} ms | Updated Counter: {self.counter}")
 
             for obj_id, data in self.tracker.tracks.items():
                 x1, y1, x2, y2 = data['bbox']
@@ -171,19 +163,16 @@ class VideoProcessor:
                 conf = data['conf']
                 color = (0, 255, 0) if label == "jerrycan_bundle" else (255, 255, 0)
                 label_text = f"{label} {conf:.2f}"
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                cv2.putText(frame, label_text, (x1, y1 - 10),
+                cv2.rectangle(frame_resized, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(frame_resized, label_text, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            # Display counter
-            cv2.putText(frame, f"Counter: {self.counter}", (20, 40),
+            cv2.putText(frame_resized, f"Counter: {self.counter}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
-            self.out.write(frame)
+            self.out.write(frame_resized)
 
         self.cleanup()
-        torch.cuda.empty_cache()
         return self.counter
 
     def cleanup(self):
