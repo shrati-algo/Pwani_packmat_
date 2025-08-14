@@ -166,4 +166,5 @@ def stop_and_return_count():
 if __name__ == "__main__":
     os.makedirs("videos", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
-    app.run(debug=True, host="0.0.0.0", port=5002)
+    app.run(debug=True, host="0.0.0.0", port=5005)
+
