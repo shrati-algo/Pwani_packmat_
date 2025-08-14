@@ -1,12 +1,12 @@
-import cv2
 import numpy as np
 import os
 import torch
 from ultralytics import YOLO
 from datetime import datetime
 import time
+import cv2
 
-# IOU calculation
+# ----------------- IOU calculation -----------------
 def iou(b1, b2):
     x1, y1, x2, y2 = b1
     x1_p, y1_p, x2_p, y2_p = b2
@@ -20,7 +20,7 @@ def iou(b1, b2):
     union_area = b1_area + b2_area - inter_area
     return inter_area / union_area if union_area != 0 else 0
 
-# NMS
+# ----------------- NMS -----------------
 def apply_nms(detections, iou_thresh=0.5):
     filtered = []
     detections.sort(key=lambda x: x[2], reverse=True)
@@ -30,7 +30,7 @@ def apply_nms(detections, iou_thresh=0.5):
         detections = [d for d in detections if d[1] != best[1] or iou(d[0], best[0]) < iou_thresh]
     return filtered
 
-# Tracker
+# ----------------- Tracker -----------------
 class ObjectTracker:
     def __init__(self, iou_threshold=0.3, max_missed=5):
         self.tracks = {}
@@ -52,7 +52,7 @@ class ObjectTracker:
                     best_iou = current_iou
                     best_id = obj_id
 
-            cy = (bbox[1] + bbox[3]) // 2
+            cy = int((bbox[1] + bbox[3]) / 2)
             print(f"[TRACKING] Object center Y: {cy}, Line Y: {line_y}")
 
             if best_id is not None:
@@ -88,7 +88,7 @@ class ObjectTracker:
         self.tracks = updated_tracks
         return counter
 
-# Video Processor
+# ----------------- Video Processor -----------------
 class VideoProcessor:
     def __init__(self, video_path, model_path=r"packmat_i2.pt", camera_id=0):
         self.cap = cv2.VideoCapture(video_path)
@@ -101,13 +101,12 @@ class VideoProcessor:
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
 
-        # Adjust counting line for 640 height
-        self.line_y = int(640 * 0.75)
+        # Counting line at 75% down from top (3/4th of frame height)
+        self.line_y = int(self.frame_height * 0.75)
         self.line_start = (0, self.line_y)
-        self.line_end = (640, self.line_y)
+        self.line_end = (self.frame_width, self.line_y)
 
-        print(f"[INFO] Original Frame size: {self.frame_width}x{self.frame_height}")
-        print(f"[INFO] Resized Frame size: 640x640, Line Y: {self.line_y}")
+        print(f"[INFO] Frame size: {self.frame_width}x{self.frame_height}, Line Y: {self.line_y}")
 
         self.counter = 0
         self.tracker = ObjectTracker()
@@ -117,7 +116,7 @@ class VideoProcessor:
         output_filename = f"cam_{self.camera_id}_{timestamp}_output.avi"
         self.output_path = os.path.join("outputs", output_filename)
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (640, 640))
+        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (self.frame_width, self.frame_height))
 
     def process_video(self, stop_flag=None):
         if not self.cap.isOpened():
@@ -133,11 +132,8 @@ class VideoProcessor:
                 print("Stream ended or interrupted.")
                 break
 
-            # Resize frame to 640x640
-            frame_resized = cv2.resize(frame, (640, 640))
-
             start_time = time.time()
-            results = self.model(frame_resized, conf=0.25, verbose=False, device=self.device)[0]
+            results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
             inference_time = (time.time() - start_time) * 1000
 
             detections = []
@@ -150,12 +146,13 @@ class VideoProcessor:
                     detections.append(((x1, y1, x2, y2), label, conf))
 
             detections = apply_nms(detections, iou_thresh=0.5)
-            cv2.line(frame_resized, self.line_start, self.line_end, (0, 0, 255), 2)
+
+            # Draw counting line
+            cv2.line(frame, self.line_start, self.line_end, (0, 255, 255), 2)
 
             self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
 
-            # Print both inference time and updated count
-            print(f"[GPU] Inference time: {inference_time:.2f} ms | Updated Counter: {self.counter}")
+            print(f"[GPU] Inference: {inference_time:.2f} ms | Count: {self.counter}")
 
             for obj_id, data in self.tracker.tracks.items():
                 x1, y1, x2, y2 = data['bbox']
@@ -163,14 +160,14 @@ class VideoProcessor:
                 conf = data['conf']
                 color = (0, 255, 0) if label == "jerrycan_bundle" else (255, 255, 0)
                 label_text = f"{label} {conf:.2f}"
-                cv2.rectangle(frame_resized, (x1, y1), (x2, y2), color, 3)
-                cv2.putText(frame_resized, label_text, (x1, y1 - 10),
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(frame, label_text, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            cv2.putText(frame_resized, f"Counter: {self.counter}", (20, 40),
+            cv2.putText(frame, f"Counter: {self.counter}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
-            self.out.write(frame_resized)
+            self.out.write(frame)
 
         self.cleanup()
         return self.counter
