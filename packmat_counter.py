@@ -126,11 +126,16 @@ class VideoProcessor:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (self.frame_width, self.frame_height))
 
-    def process_video(self):
+    def process_video(self, stop_flag=None):
         if not self.cap.isOpened():
             raise ValueError("Error: Could not open video stream.")
 
         while True:
+            
+            if stop_flag and stop_flag():
+                print("processing stopped by the user")
+                break
+            
             ret, frame = self.cap.read()
             if not ret:
                 print("Stream ended or interrupted.")
