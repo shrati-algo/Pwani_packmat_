@@ -190,7 +190,8 @@ class VideoProcessor:
     def cleanup(self):
         self.cap.release()
         self.out.release()
-        # Removed cv2.destroyAllWindows() for compatibility
+        cv2.destroyAllWindows()
+        print("video closed successfully")
 
 # # Main runner
 # if __name__ == "__main__":
