@@ -210,12 +210,13 @@ class VideoProcessor:
 #     except Exception as e:
 #         print(f"[ERROR] {str(e)}")
 
-if __name__ == "__main__":
-    # Replace this with any video path you want to test
-    sample_video = r"C:\Users\shradha\Downloads\video_2.mp4"   # e.g., put a test video in the same folder
+# if __name__ == "__main__":
+#     # Replace this with any video path you want to test
+#     sample_video = r"C:\Users\shradha\Downloads\video_2.mp4"   # e.g., put a test video in the same folder
 
-    # Initialize and process video
-    processor = VideoProcessor(video_path=sample_video, model_path="packmat_i2.pt", camera_id=1)
-    total_count = processor.process_video()
+#     # Initialize and process video
+#     processor = VideoProcessor(video_path=sample_video, model_path="packmat_i2.pt", camera_id=1)
+#     total_count = processor.process_video()
 
-    print(f"[RESULT] Total objects counted: {total_count}")
+
+#     print(f"[RESULT] Total objects counted: {total_count}")
