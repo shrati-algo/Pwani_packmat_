@@ -64,7 +64,10 @@ def concurrent_record_and_process(rtsp_link, camera_id, truck_visit_id):
 
 @app.route("/process_packmat", methods=["POST"])
 def process_video_and_generate_output():
+    
+    
     global processing_thread, stop_processing, processing_status
+    global truck_visit_id
 
     data = request.get_json()
     if not data or "trigger" not in data or "Conveyr_id" not in data or "truck_visit_id" not in data:
@@ -125,7 +128,7 @@ def stop_and_return_count():
         stop_processing = True
         if processing_thread and processing_thread.is_alive():
             processing_thread.join(timeout=10)
-
+        save_video_log(truck_visit_id,output_path=processing_status["output_path"],counter=processing_status["count"])
         return jsonify({
             "status": "stopped",
             "message": "Stopped manually.",
@@ -134,6 +137,7 @@ def stop_and_return_count():
         }), 200
 
     elif processing_status["status"] == "completed":
+        save_video_log(truck_visit_id,output_path=processing_status["output_path"],counter=processing_status["count"])
         return jsonify({
             "status": "completed",
             "object_count": processing_status["count"],
@@ -148,6 +152,6 @@ def stop_and_return_count():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5005)
+    app.run(debug=True, host="0.0.0.0", port=5000)
 
 

@@ -1,16 +1,26 @@
 import mysql.connector
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Save truck_visit_id, output_path, and object count to the database
 def save_video_log(truck_visit_id, output_path, counter):
     try:
+        db_host = os.getenv("DB_HOST")
+        db_user = os.getenv("DB_USER")
+        db_password = os.getenv("DB_PASSWORD")
+        db_name = os.getenv("DB_NAME")
+
+        # Connect to the database
         conn = mysql.connector.connect(
-            host="192.168.5.82",
-            user="root",
-            password="N47309HxFWE2Ehc",
-            database="pwani_scm"
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name
         )
         cursor = conn.cursor()
-
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS Truck_video_logs (
