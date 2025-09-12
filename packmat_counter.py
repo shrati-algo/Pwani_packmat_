@@ -123,8 +123,11 @@ class VideoProcessor:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         output_filename = f"cam_{self.camera_id}_{timestamp}_output.mp4"
         self.output_path = os.path.join("outputs", output_filename)
+        self.target_size= (640,480)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (self.frame_width, self.frame_height))
+        
+        #fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, self.target_size)
 
     def process_video(self, stop_flag=None):
         if not self.cap.isOpened():
@@ -182,7 +185,11 @@ class VideoProcessor:
             cv2.putText(frame, f"Counter: {self.counter}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
-            self.out.write(frame)
+            #self.out.write(frame)
+            # Resize frame to 480p before saving
+            frame_resized = cv2.resize(frame, self.target_size)
+            self.out.write(frame_resized)
+
 
         self.cleanup()
         return self.counter
@@ -220,3 +227,4 @@ class VideoProcessor:
 
 
 #     print(f"[RESULT] Total objects counted: {total_count}")
+ 
