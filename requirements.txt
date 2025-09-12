@@ -1,0 +1,7 @@
+opencv-python
+numpy
+ultralytics
+torch
+flask
+mysql-connector-python
+python-dotenv
