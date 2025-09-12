@@ -6,7 +6,6 @@ from packmat_counter import VideoProcessor
 from video_recorder import record_camera_stream
 import threading
 import os
-
 from datetime import datetime
 
 app = Flask(__name__)
@@ -16,7 +15,8 @@ processing_status = {
     "status": "idle",
     "count": 0,
     "output_path": None,
-    "camera_id": None
+    "camera_id": None,
+    "video_link": None   
 }
 processing_thread = None
 stop_processing = False
@@ -43,8 +43,14 @@ def concurrent_record_and_process(rtsp_link, camera_id, truck_visit_id):
         processing_status["count"] = count
         processing_status["output_path"] = processor.output_path
 
+        video_link=None
+        if processor.output_path:
+            video_name = os.path.splitext(os.path.basename(processor.output_path))[0]
+            video_link=f"192.168.5.82:5009/{video_name}"   
+            processing_status["video_link"] = video_link
+
         if not stop_processing:
-            save_video_log(truck_visit_id, processor.output_path, count)
+            save_video_log(truck_visit_id, processor.output_path, count,video_link)
             mark_video_as_processed(processor.output_path)
             processing_status["status"] = "completed"
         else:
@@ -64,8 +70,6 @@ def concurrent_record_and_process(rtsp_link, camera_id, truck_visit_id):
 
 @app.route("/process_packmat", methods=["POST"])
 def process_video_and_generate_output():
-    
-    
     global processing_thread, stop_processing, processing_status
     global truck_visit_id
 
@@ -102,7 +106,8 @@ def process_video_and_generate_output():
         "status": "running",
         "count": 0,
         "output_path": None,
-        "camera_id": camera_id
+        "camera_id": camera_id,
+        "video_link": None   # reset link
     })
 
     stop_processing = False
@@ -124,24 +129,31 @@ def process_video_and_generate_output():
 def stop_and_return_count():
     global stop_processing, processing_thread, processing_status
 
+    output_path = processing_status["output_path"]
+
     if processing_status["status"] == "running":
         stop_processing = True
         if processing_thread and processing_thread.is_alive():
             processing_thread.join(timeout=10)
-        save_video_log(truck_visit_id,output_path=processing_status["output_path"],counter=processing_status["count"])
+
+        save_video_log(truck_visit_id, output_path=processing_status["output_path"], counter=processing_status["count"],video_link=processing_status["video_link"])
+
         return jsonify({
             "status": "stopped",
             "message": "Stopped manually.",
             "object_count": processing_status["count"],
-            "output_path": processing_status["output_path"]
+            "output_path": processing_status["output_path"],
+            "video_link": processing_status["video_link"]   
         }), 200
 
     elif processing_status["status"] == "completed":
-        save_video_log(truck_visit_id,output_path=processing_status["output_path"],counter=processing_status["count"])
+        save_video_log(truck_visit_id, output_path=processing_status["output_path"], counter=processing_status["count"],video_link=processing_status["video_link"])
+
         return jsonify({
             "status": "completed",
             "object_count": processing_status["count"],
-            "output_path": processing_status["output_path"]
+            "output_path": processing_status["output_path"],
+            "video_link": processing_status["video_link"]   
         }), 200
 
     else:
@@ -152,7 +164,4 @@ def stop_and_return_count():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5005)
-
-
-
+    app.run(debug=True, host="0.0.0.0", port=5000) 
