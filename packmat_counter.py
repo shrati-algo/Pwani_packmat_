@@ -1,3 +1,6 @@
+#packmat counter code with a 2 minute buffer to save only last 2 minutes of the video file
+
+
 import cv2
 import numpy as np
 import os
@@ -5,8 +8,9 @@ from ultralytics import YOLO
 from datetime import datetime
 import torch
 import time
-# IOU calculation
+from collections import deque
 
+# IOU calculation
 def iou(b1, b2):
     x1, y1, x2, y2 = b1
     x1_p, y1_p, x2_p, y2_p = b2
@@ -56,7 +60,6 @@ class ObjectTracker:
                     best_id = obj_id
 
             cy = (bbox[1] + bbox[3]) // 2  # object center Y
-
             print(f"[TRACKING] Object center Y: {cy}, Line Y: {line_y}")
 
             if best_id is not None:
@@ -118,40 +121,38 @@ class VideoProcessor:
         self.counter = 0
         self.tracker = ObjectTracker()
 
-        # Output video writer
+        # Output video writer setup
         os.makedirs("outputs", exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         output_filename = f"cam_{self.camera_id}_{timestamp}_output.mp4"
         self.output_path = os.path.join("outputs", output_filename)
-        self.target_size= (640,480)
+        self.target_size = (640, 480)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        
-        #fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, self.target_size)
+
+        # Frame buffer for last 2 minutes
+        self.buffer_seconds = 120
+        self.frame_buffer = deque(maxlen=int(self.fps * self.buffer_seconds))
 
     def process_video(self, stop_flag=None):
         if not self.cap.isOpened():
             raise ValueError("Error: Could not open video stream.")
 
         while True:
-            
             if stop_flag and stop_flag():
                 print("processing stopped by the user")
                 break
-            
+
             ret, frame = self.cap.read()
             if not ret:
                 print("Stream ended or interrupted.")
                 break
 
-            #results = self.model(frame, conf=0.25)[0]
-            
             start_time = time.time()
             results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
             detections = []
             inference_time = (time.time() - start_time) * 1000
             print(f"[GPU] Inference time: {inference_time:.2f} ms | Updated Counter: {self.counter}")
-
 
             for box in results.boxes:
                 cls_id = int(box.cls[0])
@@ -163,10 +164,8 @@ class VideoProcessor:
 
             detections = apply_nms(detections, iou_thresh=0.5)
 
-            #Draw counting line
+            # Draw counting line
             cv2.line(frame, self.line_start, self.line_end, (0, 0, 255), 2)
-            #cv2.putText(frame, "COUNTING LINE", (self.line_start[0] + 10, self.line_y - 10),
-                        #cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
 
@@ -181,50 +180,27 @@ class VideoProcessor:
                 cv2.putText(frame, label_text, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            # Smaller counter display
+            # Counter display
             cv2.putText(frame, f"Counter: {self.counter}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
-            #self.out.write(frame)
-            # Resize frame to 480p before saving
+            # Store frame in buffer (not writing immediately)
             frame_resized = cv2.resize(frame, self.target_size)
-            self.out.write(frame_resized)
-
+            self.frame_buffer.append(frame_resized)
 
         self.cleanup()
         return self.counter
 
     def cleanup(self):
         self.cap.release()
+
+        # Write only last 2 minutes
+        print(f"[INFO] Writing last {self.buffer_seconds} seconds ({len(self.frame_buffer)} frames) to {self.output_path}")
+        for f in self.frame_buffer:
+            self.out.write(f)
+
         self.out.release()
         cv2.destroyAllWindows()
         print("video closed successfully")
 
-# # Main runner
-# if __name__ == "__main__":
-#     try:
-#         saved_video_path = r"videos\video_1.mp4"  # Change to your video path
 
-#         if not os.path.exists(saved_video_path):
-#             raise FileNotFoundError(f"Video file not found: {saved_video_path}")
-
-#         print(f"[INFO] Processing saved video: {saved_video_path}")
-#         processor = VideoProcessor(video_path=saved_video_path, camera_id=1)
-#         count = processor.process_video()
-#         print(f"[DONE] Total objects counted: {count}")
-#         print(f"[SAVED] Output video saved to: {processor.output_path}")
-
-#     except Exception as e:
-#         print(f"[ERROR] {str(e)}")
-
-# if __name__ == "__main__":
-#     # Replace this with any video path you want to test
-#     sample_video = r"C:\Users\shradha\Downloads\video_2.mp4"   # e.g., put a test video in the same folder
-
-#     # Initialize and process video
-#     processor = VideoProcessor(video_path=sample_video, model_path="packmat_i2.pt", camera_id=1)
-#     total_count = processor.process_video()
-
-
-#     print(f"[RESULT] Total objects counted: {total_count}")
- 
