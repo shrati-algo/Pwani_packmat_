@@ -45,9 +45,10 @@ def concurrent_record_and_process(rtsp_link, camera_id, truck_visit_id):
 
         video_link=None
         if processor.output_path:
-            video_name = os.path.splitext(os.path.basename(processor.output_path))[0]
-            video_link=f"192.168.5.82:5009/{video_name}"   
+            video_name = os.path.basename(processor.output_path) 
+            video_link = f"http://192.168.5.82:5009/videos/{video_name}" 
             processing_status["video_link"] = video_link
+
 
         if not stop_processing:
             save_video_log(truck_visit_id, processor.output_path, count,video_link)
@@ -164,5 +165,5 @@ def stop_and_return_count():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5005) 
-
+    app.run(debug=True, host="0.0.0.0", port=5005)
+ 
