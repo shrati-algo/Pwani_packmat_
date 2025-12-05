@@ -339,8 +339,8 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat(), "processing_status": processing_status.get("status")}
 
 
-# # If run directly with uvicorn for local debug:
-# if __name__ == "__main__":
-#     import uvicorn
-#     # For local testing only. In production use gunicorn + uvicorn worker.
-#     uvicorn.run("main_fastapi:app", host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), log_level="info")
+# If run directly with uvicorn for local debug:
+if __name__ == "__main__":
+    import uvicorn
+    # For local testing only. In production use gunicorn + uvicorn worker.
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), log_level="info")
