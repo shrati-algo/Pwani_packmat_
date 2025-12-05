@@ -1,7 +1,21 @@
+# --- Core CV & AI ---
 opencv-python
 numpy
 ultralytics
 torch
+
+# --- API Frameworks ---
+fastapi
+uvicorn[standard]
 flask
+
+# --- Database ---
 mysql-connector-python
+sqlalchemy
+
+# --- Utilities ---
 python-dotenv
+python-multipart
+pydantic
+requests
+loguru
