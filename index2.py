@@ -343,4 +343,4 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     # For local testing only. In production use gunicorn + uvicorn worker.
-    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), log_level="info")
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=int(os.environ.get("PORT", 5005)), log_level="info")
