@@ -6,9 +6,11 @@ from datetime import datetime
 import torch
 import time
 from collections import deque
+from frame_Capture import CameraLoader
+
 
 # ---------------------------------------
-# IOU calculation (FIXED)
+# IOU calculation
 # ---------------------------------------
 def iou(b1, b2):
     x1, y1, x2, y2 = b1
@@ -31,7 +33,7 @@ def iou(b1, b2):
 
 
 # ---------------------------------------
-# NMS (kept same but fixed logic)
+# NMS
 # ---------------------------------------
 def apply_nms(detections, iou_thresh=0.5):
     if not detections:
@@ -43,11 +45,7 @@ def apply_nms(detections, iou_thresh=0.5):
     while detections:
         best = detections.pop(0)
         filtered.append(best)
-
-        detections = [
-            d for d in detections
-            if iou(d[0], best[0]) < iou_thresh
-        ]
+        detections = [d for d in detections if iou(d[0], best[0]) < iou_thresh]
 
     return filtered
 
@@ -80,11 +78,6 @@ class ObjectTracker:
 
             cy = (bbox[1] + bbox[3]) // 2
 
-            print(f"[TRACKING] Object center Y: {cy}, Line Y: {line_y}")
-
-            # ----------------------------
-            # Existing object
-            # ----------------------------
             if best_id is not None:
                 last_y = self.tracks[best_id]["last_y"]
 
@@ -95,17 +88,14 @@ class ObjectTracker:
                     "last_y": cy,
                     "missed": 0
                 }
+
                 if best_id not in self.counted_ids:
-                    if last_y < line_y <= cy:  
+                    if last_y < line_y <= cy:
                         counter += 1
-                        print(f"COUNTED OBJECT {best_id}! New count = {counter}")
                         self.counted_ids.add(best_id)
 
                 used_ids.add(best_id)
 
-            # ----------------------------
-            # New object
-            # ----------------------------
             else:
                 updated_tracks[self.next_id] = {
                     "bbox": bbox,
@@ -116,7 +106,6 @@ class ObjectTracker:
                 }
                 self.next_id += 1
 
-        # Keep old unmatched tracks temporarily
         for obj_id, data in self.tracks.items():
             if obj_id not in used_ids:
                 data["missed"] += 1
@@ -126,159 +115,120 @@ class ObjectTracker:
         self.tracks = updated_tracks
         return counter
 
+
+# ---------------------------------------
+# Video Processor (LAST 60s ONLY)
+# ---------------------------------------
 class VideoProcessor:
-    def __init__(self, video_path, model_path=r"packmat_i2.pt", camera_id=0, update_hook=None):
-
-
-        self.cap = cv2.VideoCapture(video_path)
+    def __init__(
+        self,
+        model_path="packmat_i2.pt",
+        camera_id=1,
+        update_hook=None,
+        frame_skip=2,
+        fps=20,
+        buffer_seconds=60,
+        frame_size=(640, 480)
+    ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[INFO] Using device: {self.device}")
-
         self.model = YOLO(model_path).to(self.device)
-        self.camera_id = camera_id
-        self.update_hook = update_hook
 
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 20
-
-        # Counting line
-        self.line_y = int(self.frame_height * 0.75)
-        self.line_start = (0, self.line_y)
-        self.line_end = (self.frame_width, self.line_y)
-
-        print(f"[INFO] Frame size: {self.frame_width}x{self.frame_height}, Line Y: {self.line_y}")
+        self.fps = fps
+        self.frame_skip = max(1, frame_skip)
+        self.frame_index = 0
 
         self.counter = 0
         self.tracker = ObjectTracker()
+        self.update_hook = update_hook
+
+        self.target_size = frame_size
+        self.buffer_seconds = buffer_seconds
+
+        # 🔁 rolling buffer only
+        self.frame_buffer = deque(maxlen=int(self.fps * buffer_seconds))
 
         os.makedirs("outputs", exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_filename = f"cam_{self.camera_id}_{timestamp}_output.mp4"
-        output_path = os.path.join("outputs", output_filename)
-        self.output_path = output_path
+        output_filename = f"cam_{camera_id}_{timestamp}_output.mp4"
+        self.output_path = os.path.join("outputs", output_filename)
 
-        print("from packmat:", output_path)
-
-        self.target_size = (640, 480)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.out = cv2.VideoWriter(self.output_path, fourcc, self.fps, self.target_size)
-
-        # =============== NEW ===============
-        self.buffer_seconds = 60
-        max_buffer_frames = int(self.fps * self.buffer_seconds)
-        self.frame_buffer = deque(maxlen=max_buffer_frames)
-        # ===================================
+        self.line_y = None
+        self.line_start = None
+        self.line_end = None
 
 
-    def process_video(self, stop_flag=None):
-        if not self.cap.isOpened():
-            raise ValueError("Error: Could not open video stream.")
+    # -------------------------------------------------
+    def process_frame(self, frame):
+        self.frame_index += 1
 
-        while True:
-            if stop_flag and stop_flag():
-                print("processing stopped by user")
-                break
+        if frame is None:
+            return self.counter, self.output_path
 
-            ret, frame = self.cap.read()
-            if not ret:
-                print("End of video.")
-                break
+        if self.frame_index % self.frame_skip != 0:
+            return self.counter, self.output_path
 
-            start_time = time.time()
-            results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
+        if self.line_y is None:
+            h, w = frame.shape[:2]
+            self.line_y = int(h * 0.75)
+            self.line_start = (0, self.line_y)
+            self.line_end = (w, self.line_y)
 
-            detections = []
-            inference_time = (time.time() - start_time) * 1000
-            print(f"[GPU] Inference time: {inference_time:.2f} ms | Count: {self.counter}")
+        results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
 
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
-                label = self.model.names[cls_id]
-                conf = float(box.conf[0])
+        detections = []
+        for box in results.boxes:
+            cls = int(box.cls[0])
+            label = self.model.names[cls]
+            conf = float(box.conf[0])
 
-                if label.lower() in ["jerrycan_bundle", "carton", "carton_brown"] and conf > 0.6:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    detections.append(((x1, y1, x2, y2), label, conf))
+            if label.lower() in ["jerrycan_bundle", "carton", "carton_brown"] and conf > 0.6:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                detections.append(((x1, y1, x2, y2), label, conf))
 
-            detections = apply_nms(detections, iou_thresh=0.5)
+        detections = apply_nms(detections)
 
-            cv2.line(frame, self.line_start, self.line_end, (0, 0, 255), 2)
-
-            self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
-
-            if self.update_hook:
-                self.update_hook(self.counter)
-
-            # Draw objects
-            for obj_id, data in self.tracker.tracks.items():
-                x1, y1, x2, y2 = data["bbox"]
-                label = data["label"]
-                conf = data["conf"]
-
-                color = (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-            # Draw counter
-            cv2.putText(frame, f"Counter: {self.counter}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
-
-            # ================= FIXED =================
-            frame_resized = cv2.resize(frame, self.target_size)
-            self.frame_buffer.append(frame_resized)
-
-        self.cleanup()
+        cv2.line(frame, self.line_start, self.line_end, (0, 0, 255), 2)
+        self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
 
         if self.update_hook:
             self.update_hook(self.counter)
 
+        for data in self.tracker.tracks.values():
+            x1, y1, x2, y2 = data["bbox"]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        cv2.putText(frame, f"Count: {self.counter}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+
+        frame_resized = cv2.resize(frame, self.target_size)
+
+        # 🔁 update rolling buffer
+        self.frame_buffer.append(frame_resized)
+
+        # ♻️ rewrite output_path with last 60s
+        self._rewrite_last_60s_video()
+
         return self.counter, self.output_path
 
 
+    # -------------------------------------------------
+    def _rewrite_last_60s_video(self):
+        if not self.frame_buffer:
+            return
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            self.output_path,
+            fourcc,
+            self.fps,
+            self.target_size
+        )
+
+        for frame in self.frame_buffer:
+            writer.write(frame)
+
+        writer.release()
+
+
     def cleanup(self):
-        self.cap.release()
-
-        total_frames = len(self.frame_buffer)
-        expected_frames = int(self.fps * self.buffer_seconds)
-
-        print(f"[INFO] Total frames collected = {total_frames}")
-        print(f"[INFO] Expected frames for {self.buffer_seconds}s = {expected_frames}")
-
-        # If video is shorter → save full video
-        if total_frames < expected_frames:
-            print("[INFO] Saving full video (shorter than buffer).")
-            frames_to_save = list(self.frame_buffer)
-        else:
-            print(f"[INFO] Saving last {self.buffer_seconds} seconds only.")
-            frames_to_save = list(self.frame_buffer)[-expected_frames:]
-
-        print(f"[INFO] Writing {len(frames_to_save)} frames to {self.output_path}")
-
-        for f in frames_to_save:
-            self.out.write(f)
-
-        self.out.release()
-        print("video closed successfully")
-
-
-# def dummy_hook(count):
-#     print("[HOOK] Live Count Updated:", count)
-
-# if __name__ == "__main__":
-#     video_path = r"C:\Users\shradha\Downloads\cam_1_2025-07-10_13-45-45.mp4"   # <-- put your video path here
-
-#     vp = VideoProcessor(
-#         video_path=video_path,
-#         model_path=r"Pwani_packmat_-main\packmat_i2.pt",   # your YOLO model
-#         camera_id=1,
-#         update_hook=dummy_hook        # optional
-#     )
-
-#     count, output_path = vp.process_video()
-
-#     print("\n===== FINAL RESULT =====")
-#     print("Total Count :", count)
-#     print("Output Video:", output_path)
- 
+        pass
