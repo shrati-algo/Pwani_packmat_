@@ -36,11 +36,6 @@ def save_video_log(truck_visit_id, output_path, counter, video_link):
         cursor.execute("""
             INSERT INTO Truck_video_logs (truck_visit_id, output_path, object_count, video_link)
             VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE 
-                output_path = VALUES(output_path),
-                object_count = VALUES(object_count),
-                video_link = VALUES(video_link),
-                timestamp = CURRENT_TIMESTAMP
         """, (truck_visit_id, output_path, counter, video_link))
 
         conn.commit()
@@ -53,4 +48,5 @@ def save_video_log(truck_visit_id, output_path, counter, video_link):
             cursor.close()
             conn.close()
             print("[INFO] MySQL connection closed.") 
+
 
