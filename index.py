@@ -1,170 +1,242 @@
-from flask import Flask, request, jsonify
+#!/usr/bin/env python3
+
+import asyncio
+import os
+import time
+import logging
+import threading
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+
 from get_rtsp_link import get_rtsp_link
 from save_to_DB import save_video_log
 from video_tracker import mark_video_as_processed
-from packmat_counter import VideoProcessor
-from video_recorder import record_camera_stream
-import threading
-import os
-from datetime import datetime
 
-app = Flask(__name__)
+from frame_Capture import CameraLoader
+from packmat_counter_ import VideoProcessor
 
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+LOG_FILE = os.environ.get("SERVICE_LOG", "service.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("packmat_service")
+
+# --------------------------------------------------
+# FastAPI
+# --------------------------------------------------
+app = FastAPI(title="Packmat Service")
+
+# --------------------------------------------------
 # Shared state
+# --------------------------------------------------
 processing_status = {
     "status": "idle",
     "count": 0,
     "output_path": None,
     "camera_id": None,
-    "video_link": None   
+    "video_link": None,
+    "started_at": None
 }
-processing_thread = None
+
+processing_thread: Optional[threading.Thread] = None
 stop_processing = False
+status_lock = threading.Lock()
 
+truck_visit_id = None
 
-def concurrent_record_and_process(rtsp_link, camera_id, truck_visit_id):
-    global processing_status, stop_processing
+# --------------------------------------------------
+# Worker
+# --------------------------------------------------
+def frame_processing_worker(rtsp_link: str, camera_id: str, tv_id: Optional[str]):
+    global stop_processing, processing_status
 
-    # Start recording in its own thread
-    def record():
-        print(f"[{camera_id}] Starting recording...")
-        record_camera_stream(camera_id, rtsp_link, duration=120)
-        print(f"[{camera_id}] Recording finished.")
+    camera = None
+    processor = None
 
-    # Start detection/processing in its own thread
-    def detect():
-        print(f"[{camera_id}] Starting object detection...")
+    try:
+        logger.info("[%s] Worker START", camera_id)
+
+        camera = CameraLoader(rtsp_link).start()
+
         processor = VideoProcessor(
-            video_path=rtsp_link,  # pass RTSP stream directly
             model_path="packmat_i2.pt",
-            camera_id=camera_id
+            camera_id=camera_id,
+            fps=20,
+            frame_skip=2
         )
-        count = processor.process_video(stop_flag=lambda: stop_processing)
-        processing_status["count"] = count
-        processing_status["output_path"] = processor.output_path
 
-        video_link=None
-        if processor.output_path:
-            video_name = os.path.basename(processor.output_path) 
-            video_link = f"http://192.168.5.82:5009/{video_name}" 
-            processing_status["video_link"] = video_link
+        while not stop_processing:
+            frame = camera.get_latest_frame(camera_id=camera_id)
 
+            if frame is not None:
+                result = processor.process_frame(frame)
 
-        if not stop_processing:
-            save_video_log(truck_visit_id, processor.output_path, count,video_link)
-            mark_video_as_processed(processor.output_path)
+                # ----------------------------
+                # Safely unpack return
+                # ----------------------------
+                if isinstance(result, tuple):
+                    count, output_path = result
+                else:
+                    count = result
+                    output_path = processor.output_path
+
+                # ----------------------------
+                # Update shared status
+                # ----------------------------
+                with status_lock:
+                    processing_status["count"] = count
+                    processing_status["output_path"] = output_path
+
+                #print("outputpath processing:", output_path)
+
+                # ----------------------------
+                # Generate video link
+                # ----------------------------
+                video_link = None
+                if output_path:
+                    video_name = os.path.basename(output_path)
+                    video_link = f"http://192.168.5.82:5009/{video_name}"
+
+                    with status_lock:
+                        processing_status["video_link"] = video_link
+
+            time.sleep(0.001)
+
+        # -----------------------
+        # Finalize
+        # -----------------------
+        with status_lock:
             processing_status["status"] = "completed"
-        else:
-            processing_status["status"] = "stopped"
-        print(f"[{camera_id}] Detection finished.")
+            final_count = processing_status["count"]
+            output_path = processing_status["output_path"]
 
-    # Run both tasks concurrently
-    recorder_thread = threading.Thread(target=record)
-    processor_thread = threading.Thread(target=detect)
+        try:
+            save_video_log(tv_id, output_path, final_count, video_link)
+        except Exception:
+            logger.exception("[%s] save_video_log failed", camera_id)
 
-    recorder_thread.start()
-    processor_thread.start()
+        try:
+            if output_path:
+                mark_video_as_processed(output_path)
+        except Exception:
+            logger.exception("[%s] mark_video_as_processed failed", camera_id)
 
-    recorder_thread.join()
-    processor_thread.join()
+        logger.info("[%s] Worker COMPLETED", camera_id)
 
+    except Exception:
+        logger.exception("[%s] Worker ERROR", camera_id)
+        with status_lock:
+            processing_status["status"] = "error"
 
-@app.route("/process_packmat", methods=["POST"])
-def process_video_and_generate_output():
-    global processing_thread, stop_processing, processing_status
-    global truck_visit_id
+    finally:
+        try:
+            if camera:
+                camera.stop()
+        except Exception:
+            pass
 
-    data = request.get_json()
+        logger.info("[%s] Worker EXIT", camera_id)
+
+# --------------------------------------------------
+# API: START
+# --------------------------------------------------
+@app.post("/process_packmat")
+async def process_packmat(request: Request):
+    global processing_thread, stop_processing, truck_visit_id
+
+    data = await request.json()
+
     if not data or "trigger" not in data or "Conveyr_id" not in data or "truck_visit_id" not in data:
-        return jsonify({
-            "status": "error",
-            "message": "Missing required parameters."
-        }), 400
+        raise HTTPException(status_code=400, detail="Missing required parameters")
 
     if data["trigger"] == 0:
-        return jsonify({
-            "status": "stopped",
-            "message": "Trigger was 0."
-        }), 200
+        return JSONResponse({"status": "ignored", "message": "Trigger was 0"})
 
     camera_id = data["Conveyr_id"]
     truck_visit_id = data["truck_visit_id"]
 
-    try:
-        rtsp_link = get_rtsp_link(camera_id)
-        if not rtsp_link:
-            return jsonify({
-                "status": "error",
-                "message": f"No RTSP link found for camera ID {camera_id}."
-            }), 404
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+    rtsp_link = get_rtsp_link(camera_id)
+    if not rtsp_link:
+        raise HTTPException(status_code=404, detail="RTSP link not found")
 
-    processing_status.update({
-        "status": "running",
-        "count": 0,
-        "output_path": None,
-        "camera_id": camera_id,
-        "video_link": None   # reset link
-    })
+    with status_lock:
+        processing_status.update({
+            "status": "running",
+            "count": 0,
+            "output_path": None,
+            "camera_id": camera_id,
+            "video_link": None,
+            "started_at": datetime.utcnow().isoformat()
+        })
 
     stop_processing = False
 
     processing_thread = threading.Thread(
-        target=concurrent_record_and_process,
-        args=(rtsp_link, camera_id, truck_visit_id)
+        target=frame_processing_worker,
+        args=(rtsp_link, camera_id, truck_visit_id),
+        daemon=True
     )
     processing_thread.start()
 
-    return jsonify({
+    return JSONResponse({
         "status": "started",
-        "message": "Recording and processing started concurrently.",
         "camera_id": camera_id
-    }), 200
+    })
 
+# --------------------------------------------------
+# API: STOP
+# --------------------------------------------------
+@app.post("/process_packmat_end")
+async def process_packmat_end():
+    global stop_processing
 
-@app.route("/process_packmat_end", methods=["POST"])
-def stop_and_return_count():
-    global stop_processing, processing_thread, processing_status
+    stop_processing = True
 
-    output_path = processing_status["output_path"]
+    with status_lock:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "stopping",
+                "object_count": processing_status.get("count"),
+                "output_path": processing_status.get("output_path"),
+                "video_link": processing_status.get("video_link"),
+            }
+        )
 
-    if processing_status["status"] == "running":
-        stop_processing = True
-        if processing_thread and processing_thread.is_alive():
-            processing_thread.join(timeout=10)
+# --------------------------------------------------
+# API: STATUS
+# --------------------------------------------------
+@app.get("/process_packmat_status")
+async def process_packmat_status():
+    with status_lock:
+        return processing_status
 
-        save_video_log(truck_visit_id, output_path=processing_status["output_path"], counter=processing_status["count"],video_link=processing_status["video_link"])
+# --------------------------------------------------
+# Health
+# --------------------------------------------------
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
-        return jsonify({
-            "status": "stopped",
-            "message": "Stopped manually.",
-            "object_count": processing_status["count"],
-            "output_path": processing_status["output_path"],
-            "video_link": processing_status["video_link"]   
-        }), 200
-
-    elif processing_status["status"] == "completed":
-        save_video_log(truck_visit_id, output_path=processing_status["output_path"], counter=processing_status["count"],video_link=processing_status["video_link"])
-
-        return jsonify({
-            "status": "completed",
-            "object_count": processing_status["count"],
-            "output_path": processing_status["output_path"],
-            "video_link": processing_status["video_link"]   
-        }), 200
-
-    else:
-        return jsonify({
-            "status": "idle",
-            "message": "No processing running."
-        }), 200
-
-
+# --------------------------------------------------
+# Local run
+# --------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5005)
- 
-
+    import uvicorn
+    uvicorn.run(
+        "main_fastapi:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5005)),
+        log_level="info"
+    )
