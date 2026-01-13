@@ -4,7 +4,6 @@ import os
 from ultralytics import YOLO
 from datetime import datetime
 import torch
-import time
 from collections import deque
 from frame_Capture import CameraLoader
 
@@ -89,10 +88,19 @@ class ObjectTracker:
                     "missed": 0
                 }
 
+                print(
+                    f"ID: {best_id} | Label: {label} | Conf: {conf:.2f} | "
+                    f"BBox: {bbox} | CenterY: {cy}"
+                )
+
                 if best_id not in self.counted_ids:
                     if last_y < line_y <= cy:
                         counter += 1
                         self.counted_ids.add(best_id)
+                        print(
+                            f"🚨 Crossing detected! Object ID {best_id} crossed the line."
+                        )
+                        print(f"✅ Updated Count: {counter}")
 
                 used_ids.add(best_id)
 
@@ -104,6 +112,12 @@ class ObjectTracker:
                     "last_y": cy,
                     "missed": 0
                 }
+
+                print(
+                    f"NEW ID: {self.next_id} | Label: {label} | Conf: {conf:.2f} | "
+                    f"BBox: {bbox} | CenterY: {cy}"
+                )
+
                 self.next_id += 1
 
         for obj_id, data in self.tracks.items():
@@ -144,7 +158,6 @@ class VideoProcessor:
         self.target_size = frame_size
         self.buffer_seconds = buffer_seconds
 
-        # 🔁 rolling buffer only
         self.frame_buffer = deque(maxlen=int(self.fps * buffer_seconds))
 
         os.makedirs("outputs", exist_ok=True)
@@ -156,10 +169,11 @@ class VideoProcessor:
         self.line_start = None
         self.line_end = None
 
-
     # -------------------------------------------------
     def process_frame(self, frame):
         self.frame_index += 1
+
+        print(f"\n[FRAME {self.frame_index}]")
 
         if frame is None:
             return self.counter, self.output_path
@@ -172,6 +186,8 @@ class VideoProcessor:
             self.line_y = int(h * 0.75)
             self.line_start = (0, self.line_y)
             self.line_end = (w, self.line_y)
+
+        print(f"Line Y position: {self.line_y}")
 
         results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
 
@@ -187,8 +203,17 @@ class VideoProcessor:
 
         detections = apply_nms(detections)
 
+        print(f"Detected Objects: {len(detections)}")
+
+        if not detections:
+            print("No objects detected in this frame.")
+            print(f"Current Count: {self.counter}")
+
         cv2.line(frame, self.line_start, self.line_end, (0, 0, 255), 2)
-        self.counter = self.tracker.update_tracks(detections, self.line_y, self.counter)
+
+        self.counter = self.tracker.update_tracks(
+            detections, self.line_y, self.counter
+        )
 
         if self.update_hook:
             self.update_hook(self.counter)
@@ -197,19 +222,23 @@ class VideoProcessor:
             x1, y1, x2, y2 = data["bbox"]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        cv2.putText(frame, f"Count: {self.counter}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+        cv2.putText(
+            frame,
+            f"Count: {self.counter}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0, 0, 255),
+            2
+        )
 
         frame_resized = cv2.resize(frame, self.target_size)
 
-        # 🔁 update rolling buffer
         self.frame_buffer.append(frame_resized)
 
-        # ♻️ rewrite output_path with last 60s
         self._rewrite_last_60s_video()
 
         return self.counter, self.output_path
-
 
     # -------------------------------------------------
     def _rewrite_last_60s_video(self):
@@ -228,7 +257,6 @@ class VideoProcessor:
             writer.write(frame)
 
         writer.release()
-
 
     def cleanup(self):
         pass
