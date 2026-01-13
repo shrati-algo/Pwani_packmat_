@@ -25,7 +25,7 @@ def save_video_log(truck_visit_id, output_path, counter, video_link):
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS Truck_video_logs (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                truck_visit_id VARCHAR(255) UNIQUE,
+                truck_visit_id VARCHAR(255),
                 output_path TEXT,
                 object_count INT,
                 video_link TEXT,
@@ -53,3 +53,4 @@ def save_video_log(truck_visit_id, output_path, counter, video_link):
             cursor.close()
             conn.close()
             print("[INFO] MySQL connection closed.") 
+
