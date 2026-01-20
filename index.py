@@ -286,7 +286,8 @@ if __name__ == "__main__":
     uvicorn.run(
         "main_fastapi:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
+        port=int(os.environ.get("PORT", 5005)),
         log_level="info"
     )
+
 
