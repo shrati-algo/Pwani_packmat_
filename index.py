@@ -15,7 +15,7 @@ from save_to_DB import save_video_log
 from video_tracker import mark_video_as_processed
 
 from frame_Capture import CameraLoader
-from packmat_counter_2x import VideoProcessor
+from packmat_counter import VideoProcessor
 
 # --------------------------------------------------
 # Logging (file + console)
@@ -289,3 +289,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         log_level="info"
     )
+
