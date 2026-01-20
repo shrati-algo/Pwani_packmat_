@@ -1,100 +1,136 @@
-import cv2
-from collections import deque
-from threading import Thread
+import subprocess
+import threading
+import queue
+import urllib.parse
+import logging
+import numpy as np
 import time
+
+logger = logging.getLogger("CameraLoader")
+
+
+def sanitize_rtsp(rtsp_url: str) -> str:
+    """
+    Encode special characters in RTSP password.
+    Example:
+      rtsp://user:PW@n@ip/...  ->  rtsp://user:PW%40n@ip/...
+    """
+    try:
+        scheme, rest = rtsp_url.split("://", 1)
+        creds, host = rest.split("@", 1)
+        user, pwd = creds.split(":", 1)
+        pwd_encoded = urllib.parse.quote(pwd, safe="")
+        return f"{scheme}://{user}:{pwd_encoded}@{host}"
+    except Exception:
+        return rtsp_url
 
 
 class CameraLoader:
     """
-    RTSP Camera Loader (Crash-safe, Low-latency)
+    FFmpeg-based RTSP reader:
+      - Forces output resolution with -vf scale=W:H (fixes scrambled/static frames)
+      - Produces writable numpy frames (.copy()) so OpenCV can draw on them
+      - Keeps latency low by dropping old frames (only latest is kept)
+      - Auto-restarts FFmpeg if stream glitches
     """
 
-    def __init__(self, rtsp_url, camera_id=1):
-        self.rtsp_url = rtsp_url
-        self.camera_id = camera_id
+    def __init__(self, rtsp_url, width=1280, height=720, queue_size=2, reconnect_delay=0.5):
+        self.rtsp_url = sanitize_rtsp(rtsp_url)
+        self.width = int(width)
+        self.height = int(height)
 
-        self.video_objects = {}
-        self.frame_set = {camera_id: deque(maxlen=1)}
-        self.stopped = False
+        self.frame_queue = queue.Queue(maxsize=int(queue_size))
+        self.running = False
+        self.thread = None
+        self.process = None
 
-        self._open_camera()
+        self.reconnect_delay = float(reconnect_delay)
 
-    # -------------------------------------------------
-    def _open_camera(self):
-        """Open RTSP stream safely"""
-        print("[INFO] Opening RTSP stream...")
-
-        cap = cv2.VideoCapture(
-            self.rtsp_url,
-            cv2.CAP_FFMPEG
-        )
-
-        # 🔴 CRITICAL FIXES
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"H264"))
-
-        if not cap.isOpened():
-            raise RuntimeError("[ERROR] Failed to open RTSP stream")
-
-        self.video_objects[self.camera_id] = {
-            "capture_obj": cap,
-            "cameraID": self.camera_id
-        }
-
-        print("[INFO] RTSP stream opened successfully")
-
-    # -------------------------------------------------
     def start(self):
-        Thread(target=self._update_frames, daemon=True).start()
+        self.running = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+        logger.info("CameraLoader started")
         return self
 
-    # -------------------------------------------------
-    def _update_frames(self):
-        while not self.stopped:
-            cap_obj = self.video_objects.get(self.camera_id)
-            cap = cap_obj["capture_obj"]
+    def _start_ffmpeg(self):
+        cmd = [
+            "ffmpeg",
+            "-rtsp_transport", "tcp",
+            "-loglevel", "error",
+            "-an",
+            "-i", self.rtsp_url,
+
+            # ✅ CRITICAL: force a fixed output size so numpy reshape matches
+            "-vf", f"scale={self.width}:{self.height}",
+
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-"
+        ]
+        logger.info("Starting FFmpeg stream (scaled to %dx%d)", self.width, self.height)
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=10**8
+        )
+
+    def _reader(self):
+        frame_size = self.width * self.height * 3
+
+        while self.running:
+            # (re)start ffmpeg if needed
+            if self.process is None or self.process.poll() is not None:
+                try:
+                    if self.process:
+                        self.process.kill()
+                except Exception:
+                    pass
+
+                self.process = self._start_ffmpeg()
+                time.sleep(0.2)
+
+            raw_frame = self.process.stdout.read(frame_size)
+
+            # If we didn't get a full frame, restart ffmpeg
+            if len(raw_frame) != frame_size:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+                self.process = None
+                time.sleep(self.reconnect_delay)
+                continue
+
+            # ✅ writable frame for cv2.line/rectangle/putText
+            frame = np.frombuffer(raw_frame, np.uint8).reshape((self.height, self.width, 3)).copy()
+
+            # Keep only the latest frame to avoid lag
+            while not self.frame_queue.empty():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             try:
-                ret, frame = cap.read()
+                self.frame_queue.put_nowait(frame)
+            except queue.Full:
+                pass
 
-                if not ret:
-                    print("[WARN] Frame grab failed, reconnecting RTSP...")
-                    self._reconnect()
-                    continue
+        logger.info("Camera thread stopped")
 
-                self.frame_set[self.camera_id].append(frame)
-
-            except Exception as e:
-                print(f"[ERROR] RTSP read crash: {e}")
-                self._reconnect()
-
-            time.sleep(0.001)
-
-    # -------------------------------------------------
-    def _reconnect(self):
-        """Reconnect RTSP safely"""
+    def get_latest_frame(self):
         try:
-            cap = self.video_objects[self.camera_id]["capture_obj"]
-            cap.release()
-        except:
-            pass
+            return self.frame_queue.get_nowait()
+        except queue.Empty:
+            return None
 
-        time.sleep(1)
-        self._open_camera()
-
-    # -------------------------------------------------
-    def get_latest_frame(self, camera_id=1):
-        if camera_id in self.frame_set and len(self.frame_set[camera_id]) > 0:
-            return self.frame_set[camera_id][-1]
-        return None
-
-    # -------------------------------------------------
     def stop(self):
-        self.stopped = True
-
+        self.running = False
         try:
-            self.video_objects[self.camera_id]["capture_obj"].release()
-        except:
+            if self.process:
+                self.process.kill()
+        except Exception:
             pass
-
-        print("[INFO] CameraLoader stopped")
+        logger.info("CameraLoader stopped")
