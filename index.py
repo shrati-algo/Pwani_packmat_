@@ -333,7 +333,7 @@ async def process_packmat(request: Request):
                 status_code=409,
                 content={
                     "status": "busy",
-                    "message": "This camera is already processing",
+                    "message": "Selected conveyer is already in use",
                     "camera_id": camera_id
                 },
             )
@@ -442,4 +442,5 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5005)),
         log_level="info",
     )
+
 
