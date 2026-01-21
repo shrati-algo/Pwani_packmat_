@@ -178,7 +178,7 @@ class VideoProcessor:
         camera_id=1,
         frame_skip=1,
         fps=20,
-        buffer_seconds=60,
+        buffer_seconds=120,
         frame_size=(1280, 720)
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -302,4 +302,5 @@ class VideoProcessor:
         self.logger.log(f"[SAVED] {self.output_path} | Duration locked to {self.buffer_seconds:.1f}s @ {self.fps} FPS")
         self.logger.log("[LOGGER] Closing log file.")
         self.logger.close()
+
 
