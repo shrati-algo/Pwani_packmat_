@@ -53,7 +53,7 @@ app = FastAPI(title="Packmat Service (Parallel 5 Cameras)")
 # --------------------------------------------------
 FIXED_CAMERA_IDS = [1, 2, 3, 4, 5]   # fixed cameras
 
-CAMERA_LOADER_THREADS = 3           # decoding workers inside CameraLoader
+CAMERA_LOADER_THREADS = 6          # decoding workers inside CameraLoader
 
 DEFAULT_FPS = 20
 DEFAULT_FRAME_SKIP = 2
@@ -442,5 +442,6 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5005)),
         log_level="info",
     )
+
 
 
