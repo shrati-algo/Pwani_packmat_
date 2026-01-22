@@ -233,7 +233,7 @@ class VideoProcessor:
                 label = self.model.names[cls]
                 conf = float(box.conf[0])
 
-                if label.lower() in ["carton", "carton_brown", "jerrycan_bundle","sack] and conf > 0.15:
+                if label.lower() in ["carton", "carton_brown", "jerrycan_bundle","sack"] and conf > 0.15:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     detections.append(((x1, y1, x2, y2), label, conf))
 
@@ -302,5 +302,6 @@ class VideoProcessor:
         self.logger.log(f"[SAVED] {self.output_path} | Duration locked to {self.buffer_seconds:.1f}s @ {self.fps} FPS")
         self.logger.log("[LOGGER] Closing log file.")
         self.logger.close()
+
 
 
