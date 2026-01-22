@@ -15,10 +15,8 @@ from get_rtsp_link import get_rtsp_link
 from save_to_DB import save_video_log
 from video_tracker import mark_video_as_processed
 
-# Your parallel multi-camera ffmpeg loader (dict input)
 from frame_Capture import CameraLoader
 
-# Your existing processor (unchanged)
 from packmat_counter import VideoProcessor
 
 
@@ -53,7 +51,7 @@ app = FastAPI(title="Packmat Service (Parallel 5 Cameras)")
 # --------------------------------------------------
 FIXED_CAMERA_IDS = [1, 2, 3, 4, 5]   # fixed cameras
 
-CAMERA_LOADER_THREADS = 6          # decoding workers inside CameraLoader
+CAMERA_LOADER_THREADS = 6         # decoding workers inside CameraLoader
 
 DEFAULT_FPS = 20
 DEFAULT_FRAME_SKIP = 2
@@ -429,7 +427,29 @@ async def health():
         "running_jobs": list(jobs.keys()),
     }
 
+# --------------------------------------------------
+# API: STATUS (available / not-running conveyors)
+# --------------------------------------------------
+@app.get("/packmat_status")
+async def packmat_status():
+    not_running = []
 
+    with jobs_lock:
+        for cid in FIXED_CAMERA_IDS:
+            cam_id = str(cid)
+            job = jobs.get(cam_id)
+
+            is_running = (
+                job is not None
+                and job.thread is not None
+                and job.thread.is_alive()
+                and job.status in ("starting", "running", "stopping")
+            )
+
+            if not is_running:
+                not_running.append({"id": cam_id, "name": cam_id})
+
+    return not_running 
 # --------------------------------------------------
 # Local run
 # --------------------------------------------------
@@ -437,13 +457,9 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "index:app", 
+        "index:app",  # change if your filename is different
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5005)),
         log_level="info",
     )
-
-
-
-
-
+ 
