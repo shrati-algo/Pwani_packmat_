@@ -125,16 +125,155 @@ class TinyLogger:
 # ---------------------------------------
 # Tracker (FIXED)
 # ---------------------------------------
+# class ObjectTracker:
+#     def __init__(self, iou_threshold=0.22,max_missed=5):
+#         self.tracks = {}              # {id: track_data}
+#         self.iou_threshold = iou_threshold
+#         self.max_missed = max_missed
+#         self.next_id = 0
+#         self.counted_ids = set()      # IDs already counted
+
+#     def update_tracks(self, detections, line_y, counter, logger=None):
+#         log = logger.log if logger else print
+
+#         updated_tracks = {}
+#         used_ids = set()
+
+#         for bbox, label, conf in detections:
+#             best_iou = 0
+#             best_id = None
+
+#             # --------------------------------------------------
+#             # 1. MATCH detection to existing tracks (IoU-based)
+#             # --------------------------------------------------
+#             for obj_id, data in self.tracks.items():
+#                 if data["missed"] >= self.max_missed:
+#                     continue
+
+#                 match_iou = iou(bbox, data["bbox"])
+#                 if match_iou > best_iou and match_iou > self.iou_threshold:
+#                     best_iou = match_iou
+#                     best_id = obj_id
+
+#             # Use CENTER Y (much more stable than bottom Y)
+#             cy = (bbox[1] + bbox[3]) // 2
+
+#             # --------------------------------------------------
+#             # 2. UPDATE EXISTING TRACK
+#             # --------------------------------------------------
+#             if best_id is not None:
+#                 prev_state = self.tracks[best_id]["state"]
+
+#                 updated_tracks[best_id] = {
+#                     "bbox": bbox,
+#                     "label": label,
+#                     "conf": conf,
+#                     "last_y": cy,
+#                     "missed": 0,
+#                     "state": prev_state
+#                 }
+#                 used_ids.add(best_id)
+
+#                 log(
+#                     f"ID: {best_id} | Label: {label} | Conf: {conf:.2f} | "
+#                     f"BBox: {bbox} | CenterY: {cy}"
+#                 )
+
+#                 # --------------------------------------------------
+#                 # 3. STATE-BASED COUNTING (ROBUST)
+#                 # --------------------------------------------------
+#                 if best_id not in self.counted_ids:
+#                     if prev_state == "above" and cy >= line_y:
+#                         counter += 1
+#                         self.counted_ids.add(best_id)
+#                         updated_tracks[best_id]["state"] = "crossed"
+
+#                         log(
+#                             f"\n🚨 COUNT INCREMENTED 🚨\n"
+#                             f"Object ID {best_id} crossed line\n"
+#                             f"TOTAL COUNT = {counter}\n"
+#                         )
+
+#             # --------------------------------------------------
+#             # 4. CREATE NEW TRACK
+#             # --------------------------------------------------
+#             else:
+#                 state = "above" if cy < line_y else "below"
+
+#                 updated_tracks[self.next_id] = {
+#                     "bbox": bbox,
+#                     "label": label,
+#                     "conf": conf,
+#                     "last_y": cy,
+#                     "missed": 0,
+#                     "state": state
+#                 }
+
+#                 log(
+#                     f"NEW ID: {self.next_id} | Label: {label} | Conf: {conf:.2f} | "
+#                     f"BBox: {bbox} | CenterY: {cy}"
+#                 )
+
+#                 self.next_id += 1
+
+#         # --------------------------------------------------
+#         # 5. HANDLE MISSED TRACKS
+#         # --------------------------------------------------
+#         for obj_id, data in self.tracks.items():
+#             if obj_id in used_ids:
+#                 continue
+
+#             data["missed"] += 1
+#             if data["missed"] < self.max_missed and obj_id not in self.counted_ids:
+#                 updated_tracks[obj_id] = data
+
+#         self.tracks = updated_tracks
+#         return counter
+
+
 class ObjectTracker:
-    def __init__(self, iou_threshold=0.3, max_missed=4):
-        self.tracks = {}
+    def __init__(self, iou_threshold=0.22, max_missed=5):
+        self.tracks = {}              # {id: track_data}
         self.iou_threshold = iou_threshold
         self.max_missed = max_missed
         self.next_id = 0
-        self.counted_ids = set()
+        self.counted_ids = set()      # IDs already counted
 
+    # --------------------------------------------------
+    # 🔑 DEDUPE: remove duplicate tracks on same object
+    # --------------------------------------------------
+    def _dedupe_tracks(self, tracks, iou_thresh=0.75):
+        """
+        If two tracks overlap strongly, they are the same object.
+        Keep the stronger (higher confidence) one.
+        """
+        ids = list(tracks.keys())
+        remove = set()
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                id1, id2 = ids[i], ids[j]
+
+                if id1 in remove or id2 in remove:
+                    continue
+
+                if iou(tracks[id1]["bbox"], tracks[id2]["bbox"]) >= iou_thresh:
+                    # keep higher confidence track
+                    if tracks[id1]["conf"] >= tracks[id2]["conf"]:
+                        remove.add(id2)
+                    else:
+                        remove.add(id1)
+
+        for rid in remove:
+            tracks.pop(rid, None)
+
+        return tracks
+
+    # --------------------------------------------------
+    # MAIN UPDATE
+    # --------------------------------------------------
     def update_tracks(self, detections, line_y, counter, logger=None):
-        log = logger.log if logger is not None else print
+        log = logger.log if logger else print
 
         updated_tracks = {}
         used_ids = set()
@@ -143,9 +282,9 @@ class ObjectTracker:
             best_iou = 0
             best_id = None
 
-            # ✅ CHANGE 1: allow matching to tracks even if missed (until max_missed)
+            # 1. MATCH detection to existing tracks
             for obj_id, data in self.tracks.items():
-                if data.get("missed", 0) >= self.max_missed:
+                if data["missed"] >= self.max_missed:
                     continue
 
                 match_iou = iou(bbox, data["bbox"])
@@ -153,62 +292,78 @@ class ObjectTracker:
                     best_iou = match_iou
                     best_id = obj_id
 
-            cy = bbox[3]  # bottom y
+            # Use CENTER Y (stable)
+            cy = (bbox[1] + bbox[3]) // 2
 
+            # 2. UPDATE EXISTING TRACK
             if best_id is not None:
-                last_y = self.tracks[best_id]["last_y"]
+                prev_state = self.tracks[best_id]["state"]
+
                 updated_tracks[best_id] = {
                     "bbox": bbox,
                     "label": label,
                     "conf": conf,
                     "last_y": cy,
-                    "missed": 0
+                    "missed": 0,
+                    "state": prev_state
                 }
                 used_ids.add(best_id)
 
                 log(
                     f"ID: {best_id} | Label: {label} | Conf: {conf:.2f} | "
-                    f"BBox: {bbox} | BottomY: {cy}"
+                    f"BBox: {bbox} | CenterY: {cy}"
                 )
 
-                # ✅ CHANGE 2: robust line crossing using a small band
-                band = 6
+                # 3. STATE-BASED COUNTING
                 if best_id not in self.counted_ids:
-                    if last_y < (line_y - band) and cy >= (line_y + band):
+                    if prev_state == "above" and cy >= line_y:
                         counter += 1
                         self.counted_ids.add(best_id)
+                        updated_tracks[best_id]["state"] = "crossed"
+
                         log(
                             f"\n🚨 COUNT INCREMENTED 🚨\n"
                             f"Object ID {best_id} crossed line\n"
                             f"TOTAL COUNT = {counter}\n"
                         )
 
-                        updated_tracks.pop(best_id, None)
-
+            # 4. CREATE NEW TRACK
             else:
+                state = "above" if cy < line_y else "below"
+
                 updated_tracks[self.next_id] = {
                     "bbox": bbox,
                     "label": label,
                     "conf": conf,
                     "last_y": cy,
-                    "missed": 0
+                    "missed": 0,
+                    "state": state
                 }
+
                 log(
                     f"NEW ID: {self.next_id} | Label: {label} | Conf: {conf:.2f} | "
-                    f"BBox: {bbox} | BottomY: {cy}"
+                    f"BBox: {bbox} | CenterY: {cy}"
                 )
+
                 self.next_id += 1
 
-        # Handle missed tracks
+        # 5. HANDLE MISSED TRACKS
         for obj_id, data in self.tracks.items():
             if obj_id in used_ids:
                 continue
-            data["missed"] = data.get("missed", 0) + 1
+
+            data["missed"] += 1
             if data["missed"] < self.max_missed and obj_id not in self.counted_ids:
                 updated_tracks[obj_id] = data
 
+        # --------------------------------------------------
+        # 🔑 FINAL STEP: DEDUPE TRACKS (CRITICAL)
+        # --------------------------------------------------
+        updated_tracks = self._dedupe_tracks(updated_tracks, iou_thresh=0.75)
+
         self.tracks = updated_tracks
         return counter
+
 
 
 # ---------------------------------------
