@@ -15,9 +15,11 @@ from get_rtsp_link import get_rtsp_link
 from save_to_DB import save_video_log
 from video_tracker import mark_video_as_processed
 
-from frame_Capture import CameraLoader
+# Your parallel multi-camera ffmpeg loader (dict input)
+from frame_capture2 import CameraLoader
 
-from packmat_counter import VideoProcessor
+# Your existing processor (unchanged)
+from packmat_counter_3 import VideoProcessor
 
 
 # --------------------------------------------------
@@ -49,17 +51,21 @@ app = FastAPI(title="Packmat Service (Parallel 5 Cameras)")
 # --------------------------------------------------
 # Tunables (adjust if needed)
 # --------------------------------------------------
-FIXED_CAMERA_IDS = [1, 2, 3, 4, 5]   # fixed cameras
+FIXED_CAMERA_IDS = [1, 2, 3, 4, 5, 6]   # fixed cameras
 
-CAMERA_LOADER_THREADS = 6         # decoding workers inside CameraLoader
+CAMERA_LOADER_THREADS = 6              # decoding workers inside CameraLoader
 
 DEFAULT_FPS = 20
 DEFAULT_FRAME_SKIP = 2
 
-JOB_LOOP_SLEEP = 0.001              # per-job loop pacing
-STATUS_UPDATE_EVERY_N_LOOPS = 10    # reduce lock contention
+JOB_LOOP_SLEEP = 0.001                 # per-job loop pacing
+STATUS_UPDATE_EVERY_N_LOOPS = 10       # reduce lock contention
 
-NO_FRAME_WARN_SECS = 5              # warn if no frames for long
+NO_FRAME_WARN_SECS = 5                 # warn if no frames for long
+
+# How long /process_packmat_end will wait (seconds) for:
+# stop -> cleanup -> DB save completion signal
+END_CALL_WAIT_TIMEOUT_SECS = 60
 
 
 # --------------------------------------------------
@@ -69,6 +75,7 @@ NO_FRAME_WARN_SECS = 5              # warn if no frames for long
 class JobState:
     camera_id: str
     truck_visit_id: Optional[str] = None
+    truck_product_visit_id: Optional[str] = None
 
     status: str = "idle"  # idle | starting | running | stopping | completed | error
     count: int = 0
@@ -79,6 +86,9 @@ class JobState:
     error: Optional[str] = None
 
     stop_event: threading.Event = field(default_factory=threading.Event)
+    # ✅ NEW: signaled after video finalized + DB log attempted
+    completion_event: threading.Event = field(default_factory=threading.Event)
+
     thread: Optional[threading.Thread] = None
 
     # per-job processor (IMPORTANT: separate for each cam)
@@ -89,6 +99,7 @@ def job_public(job: JobState) -> Dict[str, Any]:
     return {
         "camera_id": job.camera_id,
         "truck_visit_id": job.truck_visit_id,
+        "truck_product_visit_id": job.truck_product_visit_id,
         "status": job.status,
         "count": job.count,
         "output_path": job.output_path,
@@ -103,7 +114,7 @@ def job_public(job: JobState) -> Dict[str, Any]:
 # Global shared state
 # --------------------------------------------------
 jobs_lock = threading.Lock()
-jobs: Dict[str, JobState] = {}  # key=camera_id ("1".."5")
+jobs: Dict[str, JobState] = {}  # key=camera_id ("1".."6")
 
 camera_loader: Optional[CameraLoader] = None
 camera_loader_lock = threading.Lock()
@@ -167,8 +178,9 @@ def ensure_camera_loader_running():
 def camera_job_worker(job: JobState):
     cam_id = job.camera_id
     tv_id = job.truck_visit_id
+    p_id = job.truck_product_visit_id
 
-    logger.info("[%s] JOB START tv_id=%s", cam_id, tv_id)
+    logger.info("[%s] JOB START tv_id=%s p_id=%s", cam_id, tv_id, p_id)
 
     try:
         ensure_camera_loader_running()
@@ -263,7 +275,7 @@ def camera_job_worker(job: JobState):
                 job.status = "error"
                 job.error = "processor.cleanup failed"
 
-        # Snapshot + DB log
+        # Snapshot for DB log
         with jobs_lock:
             if job.status != "error":
                 job.status = "completed"
@@ -273,13 +285,19 @@ def camera_job_worker(job: JobState):
             final_output = job.output_path
             final_link = job.video_link
 
+        # ✅ IMPORTANT CHANGE:
+        # Always signal completion_event AFTER DB log attempt,
+        # so /process_packmat_end can wait for it.
         try:
-            save_video_log(tv_id, final_output, final_count, final_link)
-            logger.info("[%s] DB log saved tv_id=%s count=%s", cam_id, tv_id, final_count)
-        except Exception:
-            logger.exception("[%s] save_video_log failed", cam_id)
-            with jobs_lock:
-                job.last_log = "save_video_log failed"
+            try:
+                save_video_log(tv_id, p_id, final_output, final_count, final_link)
+                logger.info("[%s] DB log saved tv_id=%s p_id=%s count=%s", cam_id, tv_id, p_id, final_count)
+            except Exception:
+                logger.exception("[%s] save_video_log failed", cam_id)
+                with jobs_lock:
+                    job.last_log = "save_video_log failed"
+        finally:
+            job.completion_event.set()  # ✅ SIGNAL: finalize+DB attempted done
 
         try:
             if final_output:
@@ -298,6 +316,8 @@ def camera_job_worker(job: JobState):
             job.status = "error"
             job.error = "job outer exception"
             job.last_log = str(e)[:250]
+        # Even on outer error, unblock API end call
+        job.completion_event.set()
 
     finally:
         logger.info("[%s] JOB EXIT", cam_id)
@@ -318,6 +338,7 @@ async def process_packmat(request: Request):
 
     camera_id = str(data["Conveyr_id"])
     truck_visit_id = str(data["truck_visit_id"])
+    truck_product_visit_id = str(data.get("truck_product_visit_id", ""))
 
     if camera_id not in {str(x) for x in FIXED_CAMERA_IDS}:
         raise HTTPException(status_code=400, detail=f"Invalid Conveyr_id={camera_id}. Allowed: {FIXED_CAMERA_IDS}")
@@ -326,27 +347,38 @@ async def process_packmat(request: Request):
 
     with jobs_lock:
         existing = jobs.get(camera_id)
-        if existing and existing.thread and existing.thread.is_alive() and existing.status in ("starting", "running", "stopping"):
+        if (
+            existing
+            and existing.thread
+            and existing.thread.is_alive()
+            and existing.status in ("starting", "running", "stopping")
+        ):
             return JSONResponse(
                 status_code=409,
                 content={
                     "status": "busy",
-                    "message": "Selected conveyor is already in use",
+                    "message": "This camera is already processing",
                     "camera_id": camera_id
                 },
             )
 
-        job = JobState(camera_id=camera_id, truck_visit_id=truck_visit_id)
+        # New job
+        job = JobState(
+            camera_id=camera_id,
+            truck_visit_id=truck_visit_id,
+            truck_product_visit_id=truck_product_visit_id
+        )
         job.status = "starting"
         job.started_at = datetime.utcnow().isoformat()
         job.last_log = "starting worker"
         job.stop_event.clear()
+        job.completion_event.clear()  # ✅ ensure fresh for each run
 
         t = threading.Thread(target=camera_job_worker, args=(job,), daemon=True)
         job.thread = t
         jobs[camera_id] = job
 
-        logger.info("[%s] API START accepted tv_id=%s", camera_id, truck_visit_id)
+        logger.info("[%s] API START accepted tv_id=%s p_id=%s", camera_id, truck_visit_id, truck_product_visit_id)
 
         t.start()
 
@@ -369,23 +401,45 @@ async def process_packmat_end(request: Request):
         if not job:
             raise HTTPException(status_code=404, detail=f"No job found for camera_id={camera_id}")
 
+        # Ask worker to stop
         job.stop_event.set()
         if job.status not in ("completed", "error"):
             job.status = "stopping"
-        job.last_log = "stop requested"
+        job.last_log = "stop requested, waiting for finalize+db"
+        # We'll wait outside lock
 
+    logger.info("[%s] API STOP requested — waiting for finalize+db", camera_id)
+
+    # ✅ Wait until worker finalizes + DB log attempted
+    completed = job.completion_event.wait(timeout=END_CALL_WAIT_TIMEOUT_SECS)
+
+    with jobs_lock:
         snap = job_public(job)
 
-    logger.info("[%s] API STOP requested", camera_id)
+    if not completed:
+        logger.warning("[%s] Timeout waiting for finalize+db (returning 202)", camera_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "stopping",
+                "warning": "Finalize/DB save still in progress",
+                "camera_id": camera_id,
+                "object_count": snap.get("count"),
+                "output_path": snap.get("output_path"),
+                "video_link": snap.get("video_link")
+            },
+        )
 
+    # If completed, return final snapshot (likely completed/error)
     return JSONResponse(
-        status_code=202,
+        status_code=200,
         content={
-            "status": "stopping",
+            "status": snap.get("status"),
             "camera_id": camera_id,
             "object_count": snap.get("count"),
             "output_path": snap.get("output_path"),
-            "video_link": snap.get("video_link")
+            "video_link": snap.get("video_link"),
+            "error": snap.get("error"),
         },
     )
 
@@ -427,6 +481,7 @@ async def health():
         "running_jobs": list(jobs.keys()),
     }
 
+
 # --------------------------------------------------
 # API: STATUS (available / not-running conveyors)
 # --------------------------------------------------
@@ -449,7 +504,9 @@ async def packmat_status():
             if not is_running:
                 not_running.append({"id": cam_id, "name": cam_id})
 
-    return not_running 
+    return not_running
+
+
 # --------------------------------------------------
 # Local run
 # --------------------------------------------------
@@ -462,4 +519,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5005)),
         log_level="info",
     )
- 
