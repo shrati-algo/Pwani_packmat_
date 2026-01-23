@@ -16,10 +16,10 @@ from save_to_DB import save_video_log
 from video_tracker import mark_video_as_processed
 
 # Your parallel multi-camera ffmpeg loader (dict input)
-from frame_capture2 import CameraLoader
+from frame_capture import CameraLoader
 
 # Your existing processor (unchanged)
-from packmat_counter_3_w_logs import VideoProcessor
+from packmat_counter import VideoProcessor
 
 # --------------------------------------------------
 # Logging (file + console)
@@ -50,7 +50,7 @@ app = FastAPI(title="Packmat Service (Parallel 5 Cameras)")
 # --------------------------------------------------
 # Tunables (adjust if needed)
 # --------------------------------------------------
-FIXED_CAMERA_IDS = [1, 2, 3, 4, 5, 6]   # fixed cameras
+FIXED_CAMERA_IDS = [1, 2, 3, 4, 5]   # fixed cameras
 
 CAMERA_LOADER_THREADS = 6              # decoding workers inside CameraLoader
 
@@ -516,3 +516,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         log_level="info",
     )
+
