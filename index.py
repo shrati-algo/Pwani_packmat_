@@ -16,11 +16,10 @@ from save_to_DB import save_video_log
 from video_tracker import mark_video_as_processed
 
 # Your parallel multi-camera ffmpeg loader (dict input)
-from frame_Capture import CameraLoader
+from frame_capture2 import CameraLoader
 
 # Your existing processor (unchanged)
-from packmat_counter import VideoProcessor
-
+from packmat_counter_3_w_logs import VideoProcessor
 
 # --------------------------------------------------
 # Logging (file + console)
@@ -56,7 +55,6 @@ FIXED_CAMERA_IDS = [1, 2, 3, 4, 5, 6]   # fixed cameras
 CAMERA_LOADER_THREADS = 6              # decoding workers inside CameraLoader
 
 DEFAULT_FPS = 20
-DEFAULT_FRAME_SKIP = 2
 
 JOB_LOOP_SLEEP = 0.001                 # per-job loop pacing
 STATUS_UPDATE_EVERY_N_LOOPS = 10       # reduce lock contention
@@ -189,8 +187,7 @@ def camera_job_worker(job: JobState):
         processor = VideoProcessor(
             model_path="packmat_i2.pt",
             camera_id=cam_id,
-            fps=DEFAULT_FPS,
-            frame_skip=DEFAULT_FRAME_SKIP
+            fps=DEFAULT_FPS
         )
         job.processor = processor
 
@@ -516,7 +513,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "index:app",  # change if your filename is different
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5005)),
+        port=int(os.environ.get("PORT", 5000)),
         log_level="info",
     )
-
