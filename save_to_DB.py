@@ -35,9 +35,11 @@ def save_video_log(truck_visit_id, truck_product_visit_id,output_path, counter, 
         """)
 
         cursor.execute("""
-            INSERT INTO Truck_video_logs (truck_visit_id, truck_product_visit_id,output_path, object_count, video_link)
-            VALUES (%s, %s, %s, %s)
-        """, (truck_visit_id,truck_product_visit_id, output_path, counter, video_link))
+    INSERT INTO Truck_video_logs
+    (truck_visit_id, truck_product_visit_id, output_path, object_count, video_link)
+    VALUES (%s, %s, %s, %s, %s)
+""", (truck_visit_id, truck_product_visit_id, output_path, counter, video_link))
+
 
         conn.commit()
         print(f"[INFO] Saved truck_visit_id: {truck_visit_id},truck_prod_id : {truck_product_visit_id} path: {output_path}, count: {counter}, link: {video_link}")
