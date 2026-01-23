@@ -101,136 +101,44 @@ def merge_overlapping_detections(detections, merge_iou=0.35):
 
 # ---------------------------------------
 # Tiny logger (prints + plain text .log)
+# - Folder: "packmat_counter logs"
+# - Filename: datetime timestamp (with microseconds)
+# - Each line prefixed with timestamp
 # ---------------------------------------
 class TinyLogger:
-    def __init__(self, camera_id: int, log_dir="model_logs"):
+    def __init__(self, camera_id: int, log_dir="packmat_counter logs"):
         os.makedirs(log_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.path = os.path.join(log_dir, f"cam_{camera_id}_{ts}.log")
+        # filename is just timestamp (microseconds to avoid collision)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        self.path = os.path.join(log_dir, f"{ts}.log")
+        self.camera_id = camera_id
         self._fh = open(self.path, "w", encoding="utf-8", buffering=1)
 
+        self.log(f"[LOGGER] Started for camera_id={camera_id}")
+        self.log(f"[LOGGER] Path: {self.path}")
+
     def log(self, *args, sep=" ", end="\n"):
-        msg = sep.join(str(a) for a in args) + end
-        print(*args, sep=sep, end=end)
+        prefix = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg_body = sep.join(str(a) for a in args)
+        msg = f"{prefix} {msg_body}{end}"
+
+        # print same as file (so you can see live too)
+        print(f"{prefix}", *args, sep=sep, end=end)
+
         self._fh.write(msg)
         self._fh.flush()
 
     def close(self):
         try:
+            self.log("[LOGGER] Closing log file.")
             self._fh.close()
         except Exception:
             pass
 
 
 # ---------------------------------------
-# Tracker (FIXED)
+# Tracker (unchanged logic; added logs)
 # ---------------------------------------
-# class ObjectTracker:
-#     def __init__(self, iou_threshold=0.22,max_missed=5):
-#         self.tracks = {}              # {id: track_data}
-#         self.iou_threshold = iou_threshold
-#         self.max_missed = max_missed
-#         self.next_id = 0
-#         self.counted_ids = set()      # IDs already counted
-
-#     def update_tracks(self, detections, line_y, counter, logger=None):
-#         log = logger.log if logger else print
-
-#         updated_tracks = {}
-#         used_ids = set()
-
-#         for bbox, label, conf in detections:
-#             best_iou = 0
-#             best_id = None
-
-#             # --------------------------------------------------
-#             # 1. MATCH detection to existing tracks (IoU-based)
-#             # --------------------------------------------------
-#             for obj_id, data in self.tracks.items():
-#                 if data["missed"] >= self.max_missed:
-#                     continue
-
-#                 match_iou = iou(bbox, data["bbox"])
-#                 if match_iou > best_iou and match_iou > self.iou_threshold:
-#                     best_iou = match_iou
-#                     best_id = obj_id
-
-#             # Use CENTER Y (much more stable than bottom Y)
-#             cy = (bbox[1] + bbox[3]) // 2
-
-#             # --------------------------------------------------
-#             # 2. UPDATE EXISTING TRACK
-#             # --------------------------------------------------
-#             if best_id is not None:
-#                 prev_state = self.tracks[best_id]["state"]
-
-#                 updated_tracks[best_id] = {
-#                     "bbox": bbox,
-#                     "label": label,
-#                     "conf": conf,
-#                     "last_y": cy,
-#                     "missed": 0,
-#                     "state": prev_state
-#                 }
-#                 used_ids.add(best_id)
-
-#                 log(
-#                     f"ID: {best_id} | Label: {label} | Conf: {conf:.2f} | "
-#                     f"BBox: {bbox} | CenterY: {cy}"
-#                 )
-
-#                 # --------------------------------------------------
-#                 # 3. STATE-BASED COUNTING (ROBUST)
-#                 # --------------------------------------------------
-#                 if best_id not in self.counted_ids:
-#                     if prev_state == "above" and cy >= line_y:
-#                         counter += 1
-#                         self.counted_ids.add(best_id)
-#                         updated_tracks[best_id]["state"] = "crossed"
-
-#                         log(
-#                             f"\n🚨 COUNT INCREMENTED 🚨\n"
-#                             f"Object ID {best_id} crossed line\n"
-#                             f"TOTAL COUNT = {counter}\n"
-#                         )
-
-#             # --------------------------------------------------
-#             # 4. CREATE NEW TRACK
-#             # --------------------------------------------------
-#             else:
-#                 state = "above" if cy < line_y else "below"
-
-#                 updated_tracks[self.next_id] = {
-#                     "bbox": bbox,
-#                     "label": label,
-#                     "conf": conf,
-#                     "last_y": cy,
-#                     "missed": 0,
-#                     "state": state
-#                 }
-
-#                 log(
-#                     f"NEW ID: {self.next_id} | Label: {label} | Conf: {conf:.2f} | "
-#                     f"BBox: {bbox} | CenterY: {cy}"
-#                 )
-
-#                 self.next_id += 1
-
-#         # --------------------------------------------------
-#         # 5. HANDLE MISSED TRACKS
-#         # --------------------------------------------------
-#         for obj_id, data in self.tracks.items():
-#             if obj_id in used_ids:
-#                 continue
-
-#             data["missed"] += 1
-#             if data["missed"] < self.max_missed and obj_id not in self.counted_ids:
-#                 updated_tracks[obj_id] = data
-
-#         self.tracks = updated_tracks
-#         return counter
-
-
 class ObjectTracker:
     def __init__(self, iou_threshold=0.22, max_missed=5):
         self.tracks = {}              # {id: track_data}
@@ -242,11 +150,8 @@ class ObjectTracker:
     # --------------------------------------------------
     # 🔑 DEDUPE: remove duplicate tracks on same object
     # --------------------------------------------------
-    def _dedupe_tracks(self, tracks, iou_thresh=0.75):
-        """
-        If two tracks overlap strongly, they are the same object.
-        Keep the stronger (higher confidence) one.
-        """
+    def _dedupe_tracks(self, tracks, iou_thresh=0.75, logger=None):
+        log = logger.log if logger else print
         ids = list(tracks.keys())
         remove = set()
 
@@ -257,12 +162,14 @@ class ObjectTracker:
                 if id1 in remove or id2 in remove:
                     continue
 
-                if iou(tracks[id1]["bbox"], tracks[id2]["bbox"]) >= iou_thresh:
-                    # keep higher confidence track
+                ov = iou(tracks[id1]["bbox"], tracks[id2]["bbox"])
+                if ov >= iou_thresh:
                     if tracks[id1]["conf"] >= tracks[id2]["conf"]:
                         remove.add(id2)
+                        log(f"[DEDUPE] Removing track {id2} (overlap={ov:.3f}) kept {id1}")
                     else:
                         remove.add(id1)
+                        log(f"[DEDUPE] Removing track {id1} (overlap={ov:.3f}) kept {id2}")
 
         for rid in remove:
             tracks.pop(rid, None)
@@ -278,6 +185,8 @@ class ObjectTracker:
         updated_tracks = {}
         used_ids = set()
 
+        log(f"[TRACKER] Existing tracks={len(self.tracks)} | New detections={len(detections)} | line_y={line_y}")
+
         for bbox, label, conf in detections:
             best_iou = 0
             best_id = None
@@ -292,7 +201,6 @@ class ObjectTracker:
                     best_iou = match_iou
                     best_id = obj_id
 
-            # Use CENTER Y (stable)
             cy = (bbox[1] + bbox[3]) // 2
 
             # 2. UPDATE EXISTING TRACK
@@ -310,8 +218,8 @@ class ObjectTracker:
                 used_ids.add(best_id)
 
                 log(
-                    f"ID: {best_id} | Label: {label} | Conf: {conf:.2f} | "
-                    f"BBox: {bbox} | CenterY: {cy}"
+                    f"[MATCH] ID={best_id} label={label} conf={conf:.3f} iou={best_iou:.3f} "
+                    f"bbox={bbox} cy={cy} prev_state={prev_state}"
                 )
 
                 # 3. STATE-BASED COUNTING
@@ -322,9 +230,8 @@ class ObjectTracker:
                         updated_tracks[best_id]["state"] = "crossed"
 
                         log(
-                            f"\n🚨 COUNT INCREMENTED 🚨\n"
-                            f"Object ID {best_id} crossed line\n"
-                            f"TOTAL COUNT = {counter}\n"
+                            f"[COUNT] ✅ Incremented! ID={best_id} crossed line. "
+                            f"cy={cy} line_y={line_y} TOTAL={counter}"
                         )
 
             # 4. CREATE NEW TRACK
@@ -341,8 +248,8 @@ class ObjectTracker:
                 }
 
                 log(
-                    f"NEW ID: {self.next_id} | Label: {label} | Conf: {conf:.2f} | "
-                    f"BBox: {bbox} | CenterY: {cy}"
+                    f"[NEW] ID={self.next_id} label={label} conf={conf:.3f} "
+                    f"bbox={bbox} cy={cy} state={state}"
                 )
 
                 self.next_id += 1
@@ -353,28 +260,30 @@ class ObjectTracker:
                 continue
 
             data["missed"] += 1
+            log(f"[MISSED] ID={obj_id} missed={data['missed']}/{self.max_missed} counted={obj_id in self.counted_ids}")
+
             if data["missed"] < self.max_missed and obj_id not in self.counted_ids:
                 updated_tracks[obj_id] = data
+            else:
+                log(f"[DROP] ID={obj_id} dropped (missed too much OR already counted).")
 
-        # --------------------------------------------------
-        # 🔑 FINAL STEP: DEDUPE TRACKS (CRITICAL)
-        # --------------------------------------------------
-        updated_tracks = self._dedupe_tracks(updated_tracks, iou_thresh=0.75)
+        # FINAL: DEDUPE TRACKS
+        updated_tracks = self._dedupe_tracks(updated_tracks, iou_thresh=0.75, logger=logger)
 
         self.tracks = updated_tracks
+        log(f"[TRACKER] After update: tracks={len(self.tracks)} counted_ids={len(self.counted_ids)}")
         return counter
-
 
 
 # ---------------------------------------
 # Video Processor (120s clip + FULL recording)
+# (frame_skip REMOVED; rest same)
 # ---------------------------------------
 class VideoProcessor:
     def __init__(
         self,
         model_path="packmat_i2.pt",
         camera_id=1,
-        frame_skip=1,
         fps=20,
         buffer_seconds=120,
         frame_size=(1280, 720)
@@ -386,7 +295,6 @@ class VideoProcessor:
         self.buffer_seconds = float(buffer_seconds)
         self.fixed_total_frames = int(round(self.fps * self.buffer_seconds))
 
-        self.frame_skip = max(1, int(frame_skip))
         self.frame_index = 0
         self.camera_id = camera_id
 
@@ -409,12 +317,15 @@ class VideoProcessor:
         self.line_y = None
 
         # ✅ logger per camera instance (unique file)
-        self.logger = TinyLogger(camera_id=camera_id, log_dir="model_logs")
-        self.logger.log(f"[LOGGER] Started: {self.logger.path}")
+        self.logger = TinyLogger(camera_id=camera_id, log_dir="packmat_counter logs")
 
         # ✅ full writer (lazy init on first frame)
         self._full_writer = None
         self._fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        self.logger.log(f"[INIT] device={self.device} fps={self.fps} buffer_seconds={self.buffer_seconds} fixed_total_frames={self.fixed_total_frames}")
+        self.logger.log(f"[INIT] output_path={self.output_path}")
+        self.logger.log(f"[INIT] full_output_path={self.full_output_path}")
 
     def _init_full_writer_if_needed(self):
         if self._full_writer is not None:
@@ -442,47 +353,63 @@ class VideoProcessor:
 
         if self.line_y is None:
             h = frame.shape[0]
-            self.line_y = int(h * 0.75)
+            self.line_y = int(h * 0.70)
+            self.logger.log(f"[LINE] line_y initialized to {self.line_y} (h={h})")
 
         detections = []
 
-        if self.frame_index % self.frame_skip == 0:
-            self.logger.log(f"Line Y position: {self.line_y}")
+        # ✅ frame_skip removed -> model runs every frame
+        self.logger.log(f"[RUN] Running inference on frame={self.frame_index} line_y={self.line_y}")
 
-            results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
+        results = self.model(frame, conf=0.25, verbose=False, device=self.device)[0]
 
-            for box in results.boxes:
-                cls = int(box.cls[0])
-                label = self.model.names[cls]
-                conf = float(box.conf[0])
+        for box in results.boxes:
+            cls = int(box.cls[0])
+            label = self.model.names[cls]
+            conf = float(box.conf[0])
 
-                if label.lower() in ["carton", "carton_brown", "jerrycan_bundle", "sack"] and conf > 0.15:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    detections.append(((x1, y1, x2, y2), label, conf))
+            if label.lower() in ["carton", "carton_brown", "jerrycan_bundle", "sack"] and conf > 0.15:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                detections.append(((x1, y1, x2, y2), label, conf))
 
-            # ✅ CHANGE 3: NMS with 0.5 (already default)
-            detections = apply_nms(detections, iou_thresh=0.5)
+        self.logger.log(f"[RAW] detections_before_nms={len(detections)}")
+        for (x1, y1, x2, y2), label, conf in detections[:50]:
+            self.logger.log(f"[RAWBOX] label={label} conf={conf:.3f} bbox=({x1},{y1},{x2},{y2})")
+        if len(detections) > 50:
+            self.logger.log(f"[RAWBOX] ... truncated ({len(detections)-50} more)")
 
-            # ✅ CHANGE 4: MERGE overlapping boxes into ONE (merge_iou fixed to 0.20)
-            detections = merge_overlapping_detections(detections, merge_iou=0.20)
+        detections = apply_nms(detections, iou_thresh=0.5)
+        self.logger.log(f"[NMS] detections_after_nms={len(detections)}")
 
-            self.logger.log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Detected Objects: {len(detections)}")
+        detections = merge_overlapping_detections(detections, merge_iou=0.20)
+        self.logger.log(f"[MERGE] detections_after_merge={len(detections)}")
 
-            self.counter = self.tracker.update_tracks(
-                detections, self.line_y, self.counter, logger=self.logger
-            )
+        self.logger.log(f"[DETECTED] Objects={len(detections)}")
+
+        self.counter = self.tracker.update_tracks(
+            detections, self.line_y, self.counter, logger=self.logger
+        )
 
         self.logger.log(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CURRENT TOTAL COUNT = {self.counter} FOR CAMERA ID = {self.camera_id}"
+            f"[COUNT] CURRENT TOTAL COUNT = {self.counter} FOR CAMERA ID = {self.camera_id}"
         )
 
         # Draw line
         cv2.line(frame, (0, self.line_y), (frame.shape[1], self.line_y), (0, 0, 255), 2)
 
         # Draw tracked bboxes
-        for data in self.tracker.tracks.values():
+        for tid, data in self.tracker.tracks.items():
             x1, y1, x2, y2 = data["bbox"]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"ID:{tid}",
+                (x1, max(0, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
 
         # Put count text
         cv2.putText(
@@ -545,5 +472,4 @@ class VideoProcessor:
 
         writer.release()
         self.logger.log(f"[SAVED] {self.output_path} | Duration locked to {self.buffer_seconds:.1f}s @ {self.fps} FPS")
-        self.logger.log("[LOGGER] Closing log file.")
         self.logger.close()
