@@ -7,7 +7,6 @@ torch
 # --- API Frameworks ---
 fastapi
 uvicorn[standard]
-flask
 
 # --- Database ---
 mysql-connector-python
