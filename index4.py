@@ -59,7 +59,7 @@ STATUS_UPDATE_EVERY_N_LOOPS = 10
 NO_FRAME_WARN_SECS = 5
 END_CALL_WAIT_TIMEOUT_SECS = 60
 
-RECOVERY_DB_PATH = os.environ.get("RECOVERY_DB_PATH", "recovery_state.json")
+RECOVERY_DB_PATH = os.environ.get("RECOVERY_DB_PATH", "/apps/packmat_pwani_updated/Pwani_packmat_/recovery_state.json")
 RECOVERY_HEARTBEAT_SECS = 5
 
 # --------------------------------------------------
@@ -373,6 +373,8 @@ def camera_job_worker(job: JobState):
 
                 if time.time() - last_frame_ts > NO_FRAME_WARN_SECS:
                     logger.warning("[%s] No frames received for >%ss", cam_id, NO_FRAME_WARN_SECS)
+                    job.error=("[%s] No frames received for >%ss", cam_id, NO_FRAME_WARN_SECS)
+
                     last_frame_ts = time.time()
                     with jobs_lock:
                         job.last_log = f"no frames >{NO_FRAME_WARN_SECS}s"
@@ -457,6 +459,7 @@ def camera_job_worker(job: JobState):
             final_output = job.output_path
             final_link = job.video_link
             log_id = job.db_log_id
+            error=job.error
             end_ts = job.end_pressed_at or datetime.utcnow().isoformat()
 
         # existing SQL end logging unchanged
@@ -468,7 +471,8 @@ def camera_job_worker(job: JobState):
                         output_path=final_output,
                         object_count=final_count,
                         video_link=final_link,
-                        end_pressed_at_iso=end_ts
+                        end_pressed_at_iso=end_ts,
+                        error_msg= error
                     )
                     if ok:
                         logger.info("[%s] DB log updated id=%s count=%s updatedAt=%s", cam_id, log_id, final_count, end_ts)
@@ -696,9 +700,17 @@ async def process_packmat(request: Request):
 #             "db_log_id": snap.get("db_log_id"),
 #             "end_pressed_at": snap.get("end_pressed_at"),
 #         },
-#     )
+
 @app.post("/process_packmat_end")
 async def process_packmat_end(request: Request):
+    client_ip = request.client.host
+    headers = dict(request.headers)
+
+    logger.error("🚨 END API CALLED 🚨")
+    logger.error(f"client_ip: {client_ip}")
+    logger.error(f"x-forwarded-for: {headers.get('x-forwarded-for')}")
+    logger.error(f"x-real-ip: {headers.get('x-real-ip')}")
+    logger.error(f"user-agent: {headers.get('user-agent')}")
     data = await request.json()
     if not data or "Conveyr_id" not in data:
         raise HTTPException(status_code=400, detail="Missing Conveyr_id")
@@ -970,3 +982,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5005)),
         log_level="info",
     )
+    
