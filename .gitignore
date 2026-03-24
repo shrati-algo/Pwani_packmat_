@@ -1,0 +1,15 @@
+# Ignore specific folders (anywhere in the project)
+outputs/
+encoded/
+packmat_counter logs/
+model_logs/
+stream/
+videos/
+
+# Ensure ignoring at any depth
+**/outputs/
+**/encoded/
+**/packmat_counter logs/
+**/model_logs/
+**/stream/
+**/videos/

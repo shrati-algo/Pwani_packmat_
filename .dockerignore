@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Env
+.env
+*.env
+
+# Logs
+*.log
+logs/
+
+# Videos / Outputs
+outputs/
+videos/
+recordings/
+
+# Git
+.git
+.gitignore
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
