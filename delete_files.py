@@ -37,6 +37,6 @@ def delete_old_full_videos(folder_path, days=3):
 
 
 # # 🔹 CHANGE THIS to your folder path
-folder_to_clean = r"outputs"
+# folder_to_clean = r"outputs"
 
-delete_old_full_videos(folder_to_clean, days=3)
+# delete_old_full_videos(folder_to_clean, days=3)

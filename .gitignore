@@ -13,3 +13,6 @@ videos/
 **/model_logs/
 **/stream/
 **/videos/
+
+recovery_state.json
+service.log
