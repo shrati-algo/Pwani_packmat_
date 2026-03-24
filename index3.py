@@ -4,6 +4,7 @@
 
 import os
 import time
+import json
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -12,12 +13,15 @@ from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from tinydb import TinyDB, Query
+from tinydb.storages import JSONStorage
+from tinydb.middlewares import CachingMiddleware
 
 from get_rtsp_link import get_rtsp_link
 from save_DB import save_video_log_start, update_video_log_end
 from video_tracker import mark_video_as_processed
 from frame_Capture import CameraLoader
-from packmat_counter2 import VideoProcessor
+from packmat_counter import VideoProcessor
 
 # --------------------------------------------------
 # Logging (file + console)
@@ -44,17 +48,74 @@ if not logger.handlers:
 app = FastAPI(title="Packmat Service (Parallel 5 Cameras)")
 
 # --------------------------------------------------
-# Tunables
+# Tunables (adjust if needed)
 # --------------------------------------------------
-FIXED_CAMERA_IDS = [1, 2, 3, 4, 5]   # fixed cameras / conveyors
-CAMERA_LOADER_THREADS = 5            # decoding workers inside CameraLoader
+FIXED_CAMERA_IDS = [1, 2, 3, 4, 5]  # fixed cameras
+CAMERA_LOADER_THREADS = 5           # decoding workers inside CameraLoader
 DEFAULT_FPS = 15
 
 JOB_LOOP_SLEEP = 0.001
 STATUS_UPDATE_EVERY_N_LOOPS = 10
 NO_FRAME_WARN_SECS = 5
-
 END_CALL_WAIT_TIMEOUT_SECS = 60
+
+RECOVERY_DB_PATH = os.environ.get("RECOVERY_DB_PATH", "/apps/packmat_pwani_updated/Pwani_packmat_/recovery_state2.json")
+RECOVERY_HEARTBEAT_SECS = 5
+
+# --------------------------------------------------
+# Recovery store (TinyDB) - only for active jobs
+# --------------------------------------------------
+class RecoveryStateManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._ensure_file()
+        self.db = TinyDB(db_path, storage=CachingMiddleware(JSONStorage))
+        self.Job = Query()
+
+    def _ensure_file(self):
+        try:
+            if not os.path.exists(self.db_path):
+                with open(self.db_path, "w", encoding="utf-8") as f:
+                    json.dump({}, f)
+                return
+
+            with open(self.db_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+
+            if not content:
+                with open(self.db_path, "w", encoding="utf-8") as f:
+                    json.dump({}, f)
+        except Exception:
+            with open(self.db_path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+
+    def upsert_job(self, payload: Dict[str, Any]):
+        with self.lock:
+            payload["updated_at"] = datetime.utcnow().isoformat()
+            self.db.upsert(payload, self.Job.camera_id == str(payload["camera_id"]))
+            self.db.storage.flush()
+
+    def get_job(self, camera_id: str):
+        with self.lock:
+            rows = self.db.search(self.Job.camera_id == str(camera_id))
+            return rows[0] if rows else None
+
+    def get_all_jobs(self):
+        with self.lock:
+            return list(self.db.all())
+
+    def delete_job(self, camera_id: str):
+        with self.lock:
+            self.db.remove(self.Job.camera_id == str(camera_id))
+            self.db.storage.flush()
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+
+recovery_state = RecoveryStateManager(RECOVERY_DB_PATH)
 
 # --------------------------------------------------
 # Job model
@@ -79,11 +140,6 @@ class JobState:
     # capture END pressed time to write into updatedAt
     end_pressed_at: Optional[str] = None
 
-    # debug fields
-    stop_requested_by_api: bool = False
-    exit_reason: Optional[str] = None
-    frames_seen: int = 0
-
     stop_event: threading.Event = field(default_factory=threading.Event)
     completion_event: threading.Event = field(default_factory=threading.Event)
 
@@ -105,10 +161,26 @@ def job_public(job: JobState) -> Dict[str, Any]:
         "error": job.error,
         "db_log_id": job.db_log_id,
         "end_pressed_at": job.end_pressed_at,
-        "stop_requested_by_api": job.stop_requested_by_api,
-        "exit_reason": job.exit_reason,
-        "frames_seen": job.frames_seen,
     }
+
+
+def save_job_to_recovery(job: JobState):
+    payload = {
+        "camera_id": str(job.camera_id),
+        "truck_visit_id": job.truck_visit_id,
+        "truck_product_visit_id": job.truck_product_visit_id,
+        "status": job.status,
+        "count": int(job.count or 0),
+        "output_path": job.output_path,
+        "video_link": job.video_link,
+        "started_at": job.started_at,
+        "last_log": job.last_log,
+        "error": job.error,
+        "db_log_id": job.db_log_id,
+        "end_pressed_at": job.end_pressed_at,
+    }
+    recovery_state.upsert_job(payload)
+
 
 # --------------------------------------------------
 # Global shared state
@@ -175,6 +247,64 @@ def ensure_camera_loader_running():
         logger.info("[INIT] Shared CameraLoader started. Active cams (initial frames): %s", active)
 
 # --------------------------------------------------
+# Recovery restore
+# --------------------------------------------------
+def restore_jobs_from_recovery():
+    try:
+        rows = recovery_state.get_all_jobs()
+        if not rows:
+            logger.info("[RECOVERY] No active jobs found")
+            return
+
+        logger.info("[RECOVERY] Found %s active jobs to restore", len(rows))
+
+        ensure_camera_loader_running()
+
+        for row in rows:
+            cam_id = str(row.get("camera_id"))
+            status = row.get("status")
+
+            if cam_id not in {str(x) for x in FIXED_CAMERA_IDS}:
+                logger.warning("[RECOVERY] Ignoring invalid camera_id=%s", cam_id)
+                continue
+
+            if status not in ("starting", "running", "stopping"):
+                continue
+
+            with jobs_lock:
+                existing = jobs.get(cam_id)
+                if existing and existing.thread and existing.thread.is_alive():
+                    continue
+
+                job = JobState(
+                    camera_id=cam_id,
+                    truck_visit_id=row.get("truck_visit_id"),
+                    truck_product_visit_id=row.get("truck_product_visit_id"),
+                )
+                job.status = "running"
+                job.count = int(row.get("count") or 0)
+                job.output_path = row.get("output_path")
+                job.video_link = row.get("video_link")
+                job.started_at = row.get("started_at") or datetime.utcnow().isoformat()
+                job.last_log = "restored from recovery db"
+                job.error = row.get("error")
+                job.db_log_id = row.get("db_log_id")
+                job.end_pressed_at = row.get("end_pressed_at")
+
+                job.stop_event.clear()
+                job.completion_event.clear()
+
+                t = threading.Thread(target=camera_job_worker, args=(job,), daemon=True)
+                job.thread = t
+                jobs[cam_id] = job
+                t.start()
+
+                logger.info("[RECOVERY] Restored conveyor %s with count=%s", cam_id, job.count)
+
+    except Exception:
+        logger.exception("[RECOVERY] Failed to restore jobs")
+
+# --------------------------------------------------
 # Per-camera job worker
 # --------------------------------------------------
 def camera_job_worker(job: JobState):
@@ -184,50 +314,47 @@ def camera_job_worker(job: JobState):
 
     logger.info("[%s] JOB START tv_id=%s p_id=%s", cam_id, tv_id, p_id)
 
-    exit_reason = "worker_started"
-
     try:
-        try:
-            ensure_camera_loader_running()
-        except Exception as e:
-            exit_reason = f"camera_loader_init_failed: {str(e)[:200]}"
-            raise
+        ensure_camera_loader_running()
 
-        try:
-            processor = VideoProcessor(
-                model_path="model_logs/packmat_i2.pt",
-                camera_id=cam_id,
-                fps=DEFAULT_FPS
-            )
-        except Exception as e:
-            exit_reason = f"processor_init_failed: {str(e)[:200]}"
-            raise
-
+        processor = VideoProcessor(
+        model_path="model_logs/packmat_i2.pt",
+        camera_id=cam_id,
+        fps=DEFAULT_FPS,
+        initial_count=job.count,
+        output_path=job.output_path
+        )
         job.processor = processor
+
+        # if processor supports restoring count, set it
+        try:
+            if hasattr(processor, "object_count"):
+                processor.object_count = int(job.count or 0)
+        except Exception:
+            logger.warning("[%s] Could not seed processor count from recovery state", cam_id)
 
         with jobs_lock:
             job.status = "running"
-            job.started_at = datetime.utcnow().isoformat()
+            if not job.started_at:
+                job.started_at = datetime.utcnow().isoformat()
             job.last_log = "running"
             job.error = None
-            job.exit_reason = None
+
+        save_job_to_recovery(job)
 
         last_frame_ts = time.time()
         frames_seen = 0
         loops = 0
         last_print = time.time()
+        last_recovery_save = time.time()
+        last_saved_count = int(job.count or 0)
 
         while not job.stop_event.is_set():
             loops += 1
 
             try:
                 frame = camera_loader.get_latest_frame(int(cam_id))
-            except Exception as e:
-                exit_reason = f"get_latest_frame_exception: {str(e)[:200]}"
-                logger.exception("[%s] get_latest_frame crashed", cam_id)
-                with jobs_lock:
-                    job.last_log = f"get_latest_frame crashed: {str(e)[:200]}"
-                    job.exit_reason = exit_reason
+            except Exception:
                 frame = None
 
             if frame is None:
@@ -241,9 +368,12 @@ def camera_job_worker(job: JobState):
 
                 if time.time() - last_frame_ts > NO_FRAME_WARN_SECS:
                     logger.warning("[%s] No frames received for >%ss", cam_id, NO_FRAME_WARN_SECS)
+                    job.error=("[%s] No frames received for >%ss", cam_id, NO_FRAME_WARN_SECS)
+
                     last_frame_ts = time.time()
                     with jobs_lock:
                         job.last_log = f"no frames >{NO_FRAME_WARN_SECS}s"
+                    save_job_to_recovery(job)
 
                 time.sleep(0.01)
                 continue
@@ -251,19 +381,15 @@ def camera_job_worker(job: JobState):
             frames_seen += 1
             last_frame_ts = time.time()
 
-            with jobs_lock:
-                job.frames_seen = frames_seen
-
             try:
                 count, output_path = processor.process_frame(frame)
             except Exception as e:
-                exit_reason = f"process_frame_exception: {str(e)[:200]}"
-                logger.exception("[%s] process_frame crashed | frames_seen=%s", cam_id, frames_seen)
+                logger.exception("[%s] process_frame crashed", cam_id)
                 with jobs_lock:
                     job.status = "error"
                     job.error = "process_frame crashed"
                     job.last_log = str(e)[:250]
-                    job.exit_reason = exit_reason
+                save_job_to_recovery(job)
                 break
 
             if output_path:
@@ -272,12 +398,27 @@ def camera_job_worker(job: JobState):
             else:
                 video_link = None
 
+            recovery_needs_save = False
+
             if loops % STATUS_UPDATE_EVERY_N_LOOPS == 0:
                 with jobs_lock:
-                    job.count = int(count) if count is not None else job.count
+                    new_count = int(count) if count is not None else job.count
+                    if new_count > int(job.count or 0):
+                        job.count = new_count
                     job.output_path = output_path
                     job.video_link = video_link
                     job.last_log = f"frames_seen={frames_seen}"
+
+                    if int(job.count or 0) > last_saved_count:
+                        recovery_needs_save = True
+                        last_saved_count = int(job.count or 0)
+
+            if time.time() - last_recovery_save > RECOVERY_HEARTBEAT_SECS:
+                recovery_needs_save = True
+                last_recovery_save = time.time()
+
+            if recovery_needs_save:
+                save_job_to_recovery(job)
 
             if time.time() - last_print > 5:
                 logger.info("[%s] Running | frames_seen=%s | count=%s", cam_id, frames_seen, job.count)
@@ -285,39 +426,23 @@ def camera_job_worker(job: JobState):
 
             time.sleep(JOB_LOOP_SLEEP)
 
-        if job.stop_event.is_set():
-            if job.stop_requested_by_api:
-                exit_reason = "stop_event_set_by_end_api"
-            else:
-                exit_reason = "stop_event_set_without_end_api"
-
-        with jobs_lock:
-            job.exit_reason = exit_reason
-
-        logger.info(
-            "[%s] Worker loop exited | reason=%s | stop_event=%s | api_stop=%s | frames_seen=%s",
-            cam_id,
-            exit_reason,
-            job.stop_event.is_set(),
-            job.stop_requested_by_api,
-            frames_seen,
-        )
-
         logger.info("[%s] Stop requested. Finalizing last 60s video...", cam_id)
         with jobs_lock:
             if job.status != "error":
                 job.status = "stopping"
             job.last_log = "finalizing video"
 
+        save_job_to_recovery(job)
+
         try:
             processor.cleanup()
-        except Exception as e:
-            exit_reason = f"cleanup_failed: {str(e)[:200]}"
+        except Exception:
             logger.exception("[%s] processor.cleanup failed", cam_id)
             with jobs_lock:
                 job.status = "error"
                 job.error = "processor.cleanup failed"
-                job.exit_reason = exit_reason
+                job.last_log = "processor.cleanup failed"
+            save_job_to_recovery(job)
 
         # Snapshot for DB update
         with jobs_lock:
@@ -329,9 +454,10 @@ def camera_job_worker(job: JobState):
             final_output = job.output_path
             final_link = job.video_link
             log_id = job.db_log_id
+            error=job.error
             end_ts = job.end_pressed_at or datetime.utcnow().isoformat()
 
-        # update DB row created at START
+        # existing SQL end logging unchanged
         try:
             try:
                 if log_id:
@@ -340,7 +466,8 @@ def camera_job_worker(job: JobState):
                         output_path=final_output,
                         object_count=final_count,
                         video_link=final_link,
-                        end_pressed_at_iso=end_ts
+                        end_pressed_at_iso=end_ts,
+                        error_msg= error
                     )
                     if ok:
                         logger.info("[%s] DB log updated id=%s count=%s updatedAt=%s", cam_id, log_id, final_count, end_ts)
@@ -350,12 +477,10 @@ def camera_job_worker(job: JobState):
                     logger.warning("[%s] No db_log_id present; cannot update END log", cam_id)
                     with jobs_lock:
                         job.last_log = "No db_log_id present; cannot update END log"
-            except Exception as e:
-                exit_reason = f"db_update_failed: {str(e)[:200]}"
+            except Exception:
                 logger.exception("[%s] update_video_log_end failed", cam_id)
                 with jobs_lock:
                     job.last_log = "update_video_log_end failed"
-                    job.exit_reason = exit_reason
         finally:
             job.completion_event.set()
 
@@ -368,33 +493,29 @@ def camera_job_worker(job: JobState):
             with jobs_lock:
                 job.last_log = "mark_video_as_processed failed"
 
+        # remove from recovery db only after successful completion
+        if job.status == "completed":
+            try:
+                recovery_state.delete_job(cam_id)
+                logger.info("[%s] Removed from recovery store", cam_id)
+            except Exception:
+                logger.exception("[%s] Failed to remove from recovery store", cam_id)
+        else:
+            save_job_to_recovery(job)
+
         logger.info("[%s] JOB END status=%s", cam_id, job.status)
 
     except Exception as e:
-        exit_reason = f"outer_exception: {str(e)[:200]}"
         logger.exception("[%s] JOB OUTER ERROR", cam_id)
         with jobs_lock:
             job.status = "error"
             job.error = "job outer exception"
             job.last_log = str(e)[:250]
-            job.exit_reason = exit_reason
+        save_job_to_recovery(job)
         job.completion_event.set()
 
     finally:
-        with jobs_lock:
-            final_status = job.status
-            final_reason = job.exit_reason
-            final_frames = job.frames_seen
-            final_api_stop = job.stop_requested_by_api
-
-        logger.info(
-            "[%s] JOB EXIT | final_status=%s | exit_reason=%s | frames_seen=%s | api_stop=%s",
-            cam_id,
-            final_status,
-            final_reason,
-            final_frames,
-            final_api_stop,
-        )
+        logger.info("[%s] JOB EXIT", cam_id)
 
 # --------------------------------------------------
 # API: START (parallel per camera)
@@ -445,10 +566,8 @@ async def process_packmat(request: Request):
         job.last_log = "starting worker"
         job.stop_event.clear()
         job.completion_event.clear()
-        job.stop_requested_by_api = False
-        job.exit_reason = None
-        job.frames_seen = 0
 
+        # existing SQL start logging unchanged
         try:
             job.db_log_id = save_video_log_start(truck_visit_id, truck_product_visit_id)
             logger.info("[%s] START DB log inserted id=%s", camera_id, job.db_log_id)
@@ -457,8 +576,10 @@ async def process_packmat(request: Request):
             logger.exception("[%s] save_video_log_start failed", camera_id)
             job.last_log = "save_video_log_start failed"
 
-        # non-daemon thread so job is treated as important worker
-        t = threading.Thread(target=camera_job_worker, args=(job,))
+        # recovery only
+        save_job_to_recovery(job)
+
+        t = threading.Thread(target=camera_job_worker, args=(job,), daemon=True)
         job.thread = t
         jobs[camera_id] = job
 
@@ -471,42 +592,205 @@ async def process_packmat(request: Request):
         "db_log_id": jobs.get(camera_id).db_log_id if camera_id in jobs else None
     })
 
+
+
 # --------------------------------------------------
-# API: STOP (stop one camera)
+# Global cache for idempotent END responses
 # --------------------------------------------------
+completed_jobs_cache = {}  # key -> final response
+
+
 @app.post("/process_packmat_end")
 async def process_packmat_end(request: Request):
+    client_ip = request.client.host
+    headers = dict(request.headers)
+
+    logger.info("🚨 END API CALLED 🚨")
+    logger.info(f"client_ip: {client_ip}")
+    logger.info(f"x-forwarded-for: {headers.get('x-forwarded-for')}")
+    logger.info(f"x-real-ip: {headers.get('x-real-ip')}")
+    logger.info(f"user-agent: {headers.get('user-agent')}")
+
     data = await request.json()
-    if not data or "Conveyr_id" not in data:
-        raise HTTPException(status_code=400, detail="Missing Conveyr_id")
+
+    # --------------------------------------------------
+    # 0. Validate required fields
+    # --------------------------------------------------
+    required_fields = ["Conveyr_id", "truck_visit_id", "truck_product_visit_id", "status","sourceAPI"]
+
+    if not data or any(field not in data for field in required_fields):
+        raise HTTPException(status_code=400, detail="Missing required fields")
 
     camera_id = str(data["Conveyr_id"])
+    truck_visit_id = str(data["truck_visit_id"])
+    truck_product_visit_id = str(data["truck_product_visit_id"])
+  
+    incoming_status = str(data["status"]).lower()
+    source_api = str(data["sourceAPI"])
 
+    # Unique idempotency key
+    job_key = f"{camera_id}_{truck_visit_id}_{truck_product_visit_id}"
+
+    # --------------------------------------------------
+    # 🔁 1. Idempotency check (return cached response)
+    # --------------------------------------------------
+    if job_key in completed_jobs_cache:
+        logger.info(f"[{camera_id}] Returning cached END response (idempotent)")
+        return JSONResponse(status_code=200, content=completed_jobs_cache[job_key])
+
+    # --------------------------------------------------
+    # 🔒 2. Allow ONLY backend to trigger END
+    # --------------------------------------------------
+    if incoming_status != "backend":
+        logger.warning(f"[{camera_id}] Unauthorized END blocked (status={incoming_status}) via {source_api}")
+        raise HTTPException(
+            status_code=403,
+            detail="END API can only be triggered by backend"
+        )
+
+    # --------------------------------------------------
+    # 3. Try to find active job in memory
+    # --------------------------------------------------
     with jobs_lock:
         job = jobs.get(camera_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"No offloading has been started on conveyor number :{camera_id}")
 
-        job.end_pressed_at = datetime.utcnow().isoformat()
-        job.stop_requested_by_api = True
-        job.stop_event.set()
+    # --------------------------------------------------
+    # 4. Try rebuilding from recovery if not in memory
+    # --------------------------------------------------
+    if not job:
+        saved = recovery_state.get_job(camera_id)
+        logger.info(f"[{camera_id}] No active job in memory, checking recovery db: {'found' if saved else 'not found'}")
+        if saved:
+            saved_status = saved.get("status", "running")
 
-        if job.status not in ("completed", "error"):
-            job.status = "stopping"
-        job.last_log = "stop requested, waiting for finalize+db"
+            if saved_status in ("running", "stopping"):
+                rebuilt_job = JobState(
+                    camera_id=str(saved.get("camera_id")),
+                    truck_visit_id=saved.get("truck_visit_id"),
+                    truck_product_visit_id=saved.get("truck_product_visit_id"),
+                )
+                rebuilt_job.status = saved_status
+                rebuilt_job.count = int(saved.get("count") or 0)
+                rebuilt_job.output_path = saved.get("output_path")
+                rebuilt_job.video_link = saved.get("video_link")
+                rebuilt_job.started_at = saved.get("started_at")
+                rebuilt_job.last_log = "rebuilt from recovery db for stopping"
+                rebuilt_job.error = saved.get("error")
+                rebuilt_job.db_log_id = saved.get("db_log_id")
+                rebuilt_job.end_pressed_at = saved.get("end_pressed_at")
 
-    logger.info("[%s] API STOP requested — waiting for finalize+db", camera_id)
+                with jobs_lock:
+                    jobs[camera_id] = rebuilt_job
+                    job = rebuilt_job
 
+    # --------------------------------------------------
+    # 5. If no job anywhere → already stopped (idempotent success)
+    # --------------------------------------------------
+    if not job:
+        logger.info(f"[{camera_id}] END called but job already completed")
+
+        final_response = {
+            "status": "completed",
+            "camera_id": camera_id,
+            "object_count": 0,
+            "output_path": None,
+            "video_link": None,
+            "db_log_id": None,
+            "end_pressed_at": None,
+        }
+
+        completed_jobs_cache[job_key] = final_response
+
+        return JSONResponse(status_code=200, content=final_response)
+
+    # --------------------------------------------------
+    # 6. If job already completed → return same response
+    # --------------------------------------------------
+    if job.status not in ("running", "stopping"):
+        with jobs_lock:
+            jobs.pop(camera_id, None)
+
+        final_response = {
+            "status": job.status,
+            "camera_id": camera_id,
+            "object_count": job.count,
+            "output_path": job.output_path,
+            "video_link": job.video_link,
+            "db_log_id": job.db_log_id,
+            "end_pressed_at": job.end_pressed_at,
+        }
+
+        completed_jobs_cache[job_key] = final_response
+
+        return JSONResponse(status_code=200, content=final_response)
+
+    # --------------------------------------------------
+    # 7. Request stop
+    # --------------------------------------------------
+    with jobs_lock:
+        if not job.end_pressed_at:
+            job.end_pressed_at = datetime.utcnow().isoformat()
+
+        worker_alive = job.thread is not None and job.thread.is_alive()
+
+        if worker_alive:
+            job.stop_event.set()
+            if job.status == "running":
+                job.status = "stopping"
+            job.last_log = "stop requested, waiting for finalize+db"
+            save_job_to_recovery(job)
+
+    logger.info("[%s] API STOP requested by %s — waiting for finalize+db", camera_id, incoming_status)
+
+    # --------------------------------------------------
+    # 8. Worker not alive case
+    # --------------------------------------------------
+    if not worker_alive:
+        saved = recovery_state.get_job(camera_id)
+
+        if not saved or saved.get("status") not in ("running", "stopping"):
+            final_response = {
+                "status": "completed",
+                "camera_id": camera_id,
+                "object_count": job.count,
+                "output_path": job.output_path,
+                "video_link": job.video_link,
+                "db_log_id": job.db_log_id,
+                "end_pressed_at": job.end_pressed_at,
+            }
+
+            completed_jobs_cache[job_key] = final_response
+
+            return JSONResponse(status_code=200, content=final_response)
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": saved.get("status", job.status),
+                "warning": "Stop requested earlier; finalize/DB save in progress",
+                "camera_id": camera_id,
+                "object_count": int(saved.get("count") or job.count or 0),
+                "output_path": saved.get("output_path") or job.output_path,
+                "video_link": saved.get("video_link") or job.video_link,
+                "db_log_id": saved.get("db_log_id") or job.db_log_id,
+                "end_pressed_at": saved.get("end_pressed_at") or job.end_pressed_at,
+            },
+        )
+
+    # --------------------------------------------------
+    # 9. Wait for completion
+    # --------------------------------------------------
     completed = job.completion_event.wait(timeout=END_CALL_WAIT_TIMEOUT_SECS)
-
-    if completed and job.thread and job.thread.is_alive():
-        job.thread.join(timeout=2)
 
     with jobs_lock:
         snap = job_public(job)
 
+    # --------------------------------------------------
+    # 10. Still processing
+    # --------------------------------------------------
     if not completed:
-        logger.warning("[%s] Timeout waiting for finalize+db (returning 202)", camera_id)
+        logger.warning("[%s] Timeout waiting for finalize+db", camera_id)
+
         return JSONResponse(
             status_code=202,
             content={
@@ -517,26 +801,34 @@ async def process_packmat_end(request: Request):
                 "output_path": snap.get("output_path"),
                 "video_link": snap.get("video_link"),
                 "db_log_id": snap.get("db_log_id"),
-                "exit_reason": snap.get("exit_reason"),
-                "frames_seen": snap.get("frames_seen"),
+                "end_pressed_at": snap.get("end_pressed_at"),
             },
         )
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": snap.get("status"),
-            "camera_id": camera_id,
-            "object_count": snap.get("count"),
-            "output_path": snap.get("output_path"),
-            "video_link": snap.get("video_link"),
-            "db_log_id": snap.get("db_log_id"),
-            "end_pressed_at": snap.get("end_pressed_at"),
-            "exit_reason": snap.get("exit_reason"),
-            "frames_seen": snap.get("frames_seen"),
-            "stop_requested_by_api": snap.get("stop_requested_by_api"),
-        },
-    )
+    # --------------------------------------------------
+    # 11. Final response
+    # --------------------------------------------------
+    final_status = snap.get("status")
+
+    final_response = {
+        "status": final_status,
+        "camera_id": camera_id,
+        "object_count": snap.get("count"),
+        "output_path": snap.get("output_path"),
+        "video_link": snap.get("video_link"),
+        "db_log_id": snap.get("db_log_id"),
+        "end_pressed_at": snap.get("end_pressed_at"),
+    }
+
+    # Save for idempotency
+    completed_jobs_cache[job_key] = final_response
+
+    if final_status in ("completed", "error"):
+        with jobs_lock:
+            jobs.pop(camera_id, None)
+
+    return JSONResponse(status_code=200, content=final_response)
+
 
 # --------------------------------------------------
 # API: STATUS (all or one)
@@ -548,10 +840,25 @@ async def process_packmat_status(camera_id: Optional[str] = None):
             cam = str(camera_id)
             job = jobs.get(cam)
             if not job:
+                saved = recovery_state.get_job(cam)
+                if saved:
+                    return saved
                 raise HTTPException(status_code=404, detail=f"No job found for camera_id={cam}")
             return job_public(job)
 
-        return {cid: job_public(job) for cid, job in jobs.items()}
+        all_jobs = {cid: job_public(job) for cid, job in jobs.items()}
+
+    # include recovery-only jobs that are not loaded in memory
+    try:
+        recovered = recovery_state.get_all_jobs()
+        for row in recovered:
+            cam_id = str(row.get("camera_id"))
+            if cam_id not in all_jobs:
+                all_jobs[cam_id] = row
+    except Exception:
+        logger.exception("[STATUS] Failed to read recovery store")
+
+    return all_jobs
 
 # --------------------------------------------------
 # Health
@@ -559,8 +866,6 @@ async def process_packmat_status(camera_id: Optional[str] = None):
 @app.get("/health")
 async def health():
     active = []
-    running_jobs = []
-
     try:
         if camera_loader:
             for cid, frames in camera_loader.frame_set.items():
@@ -570,13 +875,7 @@ async def health():
         pass
 
     with jobs_lock:
-        for cid, job in jobs.items():
-            if (
-                job.thread
-                and job.thread.is_alive()
-                and job.status in ("starting", "running", "stopping")
-            ):
-                running_jobs.append(cid)
+        running_jobs = list(jobs.keys())
 
     return {
         "status": "ok",
@@ -593,21 +892,39 @@ async def packmat_status():
     not_running = []
 
     with jobs_lock:
-        for cid in FIXED_CAMERA_IDS:
-            cam_id = str(cid)
-            job = jobs.get(cam_id)
+        memory_jobs = dict(jobs)
 
-            is_running = (
-                job is not None
-                and job.thread is not None
-                and job.thread.is_alive()
-                and job.status in ("starting", "running", "stopping")
-            )
+    for cid in FIXED_CAMERA_IDS:
+        cam_id = str(cid)
+        job = memory_jobs.get(cam_id)
 
-            if not is_running:
-                not_running.append({"id": cam_id, "name": cam_id})
+        is_running = (
+            job is not None
+            and job.thread is not None
+            and job.thread.is_alive()
+            and job.status in ("starting", "running", "stopping")
+        )
+
+        if not is_running:
+            not_running.append({"id": cam_id, "name": cam_id})
 
     return not_running
+
+# --------------------------------------------------
+# Startup / shutdown hooks
+# --------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    logger.info("[APP] Startup recovery begin")
+    restore_jobs_from_recovery()
+    logger.info("[APP] Startup recovery complete")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        recovery_state.close()
+    except Exception:
+        logger.exception("[APP] Failed closing recovery store")
 
 # --------------------------------------------------
 # Local run
@@ -618,6 +935,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "index3:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5005)),
+        port=int(os.environ.get("PORT", 8000)),
         log_level="info",
     )
+    
