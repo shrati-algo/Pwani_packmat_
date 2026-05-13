@@ -21,7 +21,8 @@ from get_rtsp_link import get_rtsp_link
 from save_DB import save_video_log_start, update_video_log_end
 from video_tracker import mark_video_as_processed
 from frame_Capture import CameraLoader
-from packmat_counter import VideoProcessor
+from packmat_counter2 import VideoProcessor
+from delete_files import delete_old_full_videos
 
 # --------------------------------------------------
 # Logging (file + console)
@@ -59,8 +60,9 @@ STATUS_UPDATE_EVERY_N_LOOPS = 10
 NO_FRAME_WARN_SECS = 5
 END_CALL_WAIT_TIMEOUT_SECS = 60
 
-RECOVERY_DB_PATH = os.environ.get("RECOVERY_DB_PATH", "/apps/packmat_pwani_updated/Pwani_packmat_/recovery_state2.json")
+RECOVERY_DB_PATH = os.environ.get("RECOVERY_DB_PATH", "/apps/packmat_pwani_updated/Pwani_packmat_/recovery_state.json")
 RECOVERY_HEARTBEAT_SECS = 5
+
 
 # --------------------------------------------------
 # Recovery store (TinyDB) - only for active jobs
@@ -120,6 +122,27 @@ recovery_state = RecoveryStateManager(RECOVERY_DB_PATH)
 # --------------------------------------------------
 # Job model
 # --------------------------------------------------
+
+
+def append_error(job: "JobState", message: str):
+    try:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        new_msg = f"[{ts}] {message}"
+
+        if job.error:
+            if new_msg not in job.error:
+                job.error = f"{job.error} | {new_msg}"
+        else:
+            job.error = new_msg
+
+        # Optional: limit size
+        MAX_ERROR_LENGTH = 2000
+        if len(job.error) > MAX_ERROR_LENGTH:
+            job.error = job.error[-MAX_ERROR_LENGTH:]
+
+    except Exception as e:
+        logger.exception("Failed to append error: %s", str(e))
+        
 @dataclass
 class JobState:
     camera_id: str
@@ -268,7 +291,7 @@ def restore_jobs_from_recovery():
                 logger.warning("[RECOVERY] Ignoring invalid camera_id=%s", cam_id)
                 continue
 
-            if status not in ("starting", "running", "stopping"):
+            if status not in ("starting", "running", "stopping","error"):
                 continue
 
             with jobs_lock:
@@ -287,7 +310,7 @@ def restore_jobs_from_recovery():
                 job.video_link = row.get("video_link")
                 job.started_at = row.get("started_at") or datetime.utcnow().isoformat()
                 job.last_log = "restored from recovery db"
-                job.error = row.get("error")
+                append_error(job, "Service restarted during processing")
                 job.db_log_id = row.get("db_log_id")
                 job.end_pressed_at = row.get("end_pressed_at")
 
@@ -318,11 +341,11 @@ def camera_job_worker(job: JobState):
         ensure_camera_loader_running()
 
         processor = VideoProcessor(
-        model_path="model_logs/packmat_i2.pt",
-        camera_id=cam_id,
-        fps=DEFAULT_FPS,
-        initial_count=job.count,
-        output_path=job.output_path
+            model_path="model_logs/packmat_i2.pt",
+            camera_id=cam_id,
+            fps=DEFAULT_FPS,
+            initial_count=job.count,
+            output_path=job.output_path
         )
         job.processor = processor
 
@@ -338,7 +361,6 @@ def camera_job_worker(job: JobState):
             if not job.started_at:
                 job.started_at = datetime.utcnow().isoformat()
             job.last_log = "running"
-            job.error = None
 
         save_job_to_recovery(job)
 
@@ -368,8 +390,7 @@ def camera_job_worker(job: JobState):
 
                 if time.time() - last_frame_ts > NO_FRAME_WARN_SECS:
                     logger.warning("[%s] No frames received for >%ss", cam_id, NO_FRAME_WARN_SECS)
-                    job.error=("[%s] No frames received for >%ss", cam_id, NO_FRAME_WARN_SECS)
-
+                    append_error(job, f"No frame")
                     last_frame_ts = time.time()
                     with jobs_lock:
                         job.last_log = f"no frames >{NO_FRAME_WARN_SECS}s"
@@ -385,12 +406,39 @@ def camera_job_worker(job: JobState):
                 count, output_path = processor.process_frame(frame)
             except Exception as e:
                 logger.exception("[%s] process_frame crashed", cam_id)
+
                 with jobs_lock:
-                    job.status = "error"
-                    job.error = "process_frame crashed"
+                    append_error(job, f"process_frame crashed: {str(e)}")
                     job.last_log = str(e)[:250]
+
                 save_job_to_recovery(job)
-                break
+
+                # 🔥 Try self-healing (VERY IMPORTANT)
+                try:
+                    if job.processor:
+                        job.processor.cleanup()
+                except Exception:
+                    pass
+
+                try:
+                    delete_old_full_videos(folder_path=r"outputs", days=2)
+                    print ( "deleted old full videos")
+                    
+                    processor = VideoProcessor(
+                        model_path="model_logs/packmat_i2.pt",
+                        camera_id=cam_id,
+                        fps=DEFAULT_FPS,
+                        initial_count=job.count,
+                        output_path=job.output_path
+                    )
+                    job.processor = processor
+                    append_error(job, "processor restarted after crash")
+                except Exception as e2:
+                    append_error(job, f"processor restart failed: {str(e2)}")
+                    time.sleep(1)
+
+                # 🚫 DO NOT BREAK; continue main loop
+                continue
 
             if output_path:
                 video_name = os.path.basename(output_path)
@@ -440,7 +488,7 @@ def camera_job_worker(job: JobState):
             logger.exception("[%s] processor.cleanup failed", cam_id)
             with jobs_lock:
                 job.status = "error"
-                job.error = "processor.cleanup failed"
+                append_error(job, "processor.cleanup failed")
                 job.last_log = "processor.cleanup failed"
             save_job_to_recovery(job)
 
@@ -454,7 +502,7 @@ def camera_job_worker(job: JobState):
             final_output = job.output_path
             final_link = job.video_link
             log_id = job.db_log_id
-            error=job.error
+            error = job.error
             end_ts = job.end_pressed_at or datetime.utcnow().isoformat()
 
         # existing SQL end logging unchanged
@@ -467,7 +515,7 @@ def camera_job_worker(job: JobState):
                         object_count=final_count,
                         video_link=final_link,
                         end_pressed_at_iso=end_ts,
-                        error_msg= error
+                        error_msg=error
                     )
                     if ok:
                         logger.info("[%s] DB log updated id=%s count=%s updatedAt=%s", cam_id, log_id, final_count, end_ts)
@@ -509,7 +557,7 @@ def camera_job_worker(job: JobState):
         logger.exception("[%s] JOB OUTER ERROR", cam_id)
         with jobs_lock:
             job.status = "error"
-            job.error = "job outer exception"
+            append_error(job, f"Job failed with exception: {str(e)}")
             job.last_log = str(e)[:250]
         save_job_to_recovery(job)
         job.completion_event.set()
@@ -599,219 +647,99 @@ async def process_packmat(request: Request):
 # --------------------------------------------------
 completed_jobs_cache = {}  # key -> final response
 
-
 @app.post("/process_packmat_end")
 async def process_packmat_end(request: Request):
-    client_ip = request.client.host
-    headers = dict(request.headers)
-
-    logger.info("🚨 END API CALLED 🚨")
-    logger.info(f"client_ip: {client_ip}")
-    logger.info(f"x-forwarded-for: {headers.get('x-forwarded-for')}")
-    logger.info(f"x-real-ip: {headers.get('x-real-ip')}")
-    logger.info(f"user-agent: {headers.get('user-agent')}")
-
     data = await request.json()
+    logger.info(f"[END API] Received body: {data}")
 
-    # --------------------------------------------------
-    # 0. Validate required fields
-    # --------------------------------------------------
-    required_fields = ["Conveyr_id", "truck_visit_id", "truck_product_visit_id", "status","sourceAPI"]
-
+    required_fields = ["Conveyr_id", "truck_visit_id", "truck_product_visit_id", "status"]
     if not data or any(field not in data for field in required_fields):
         raise HTTPException(status_code=400, detail="Missing required fields")
 
     camera_id = str(data["Conveyr_id"])
     truck_visit_id = str(data["truck_visit_id"])
     truck_product_visit_id = str(data["truck_product_visit_id"])
-  
     incoming_status = str(data["status"]).lower()
-    source_api = str(data["sourceAPI"])
+    source_api = str(data["sourceApi"])
 
-    # Unique idempotency key
-    job_key = f"{camera_id}_{truck_visit_id}_{truck_product_visit_id}"
-
-    # --------------------------------------------------
-    # 🔁 1. Idempotency check (return cached response)
-    # --------------------------------------------------
-    if job_key in completed_jobs_cache:
-        logger.info(f"[{camera_id}] Returning cached END response (idempotent)")
-        return JSONResponse(status_code=200, content=completed_jobs_cache[job_key])
-
-    # --------------------------------------------------
-    # 🔒 2. Allow ONLY backend to trigger END
-    # --------------------------------------------------
+    # Only backend can trigger END
     if incoming_status != "backend":
-        logger.warning(f"[{camera_id}] Unauthorized END blocked (status={incoming_status}) via {source_api}")
-        raise HTTPException(
-            status_code=403,
-            detail="END API can only be triggered by backend"
-        )
+        raise HTTPException(status_code=403, detail="END API can only be triggered by backend")
 
-    # --------------------------------------------------
-    # 3. Try to find active job in memory
-    # --------------------------------------------------
+    # Timestamp for this END call (for multiple presses)
+    timestamp_now = datetime.utcnow().isoformat()
+    job_key = f"{camera_id}_{truck_visit_id}_{truck_product_visit_id}_{timestamp_now}"
+
+    # 1️⃣ Try to find job in memory
     with jobs_lock:
         job = jobs.get(camera_id)
 
-    # --------------------------------------------------
-    # 4. Try rebuilding from recovery if not in memory
-    # --------------------------------------------------
+    # 2️⃣ Rebuild from recovery DB if not found in memory
     if not job:
         saved = recovery_state.get_job(camera_id)
-        logger.info(f"[{camera_id}] No active job in memory, checking recovery db: {'found' if saved else 'not found'}")
-        if saved:
-            saved_status = saved.get("status", "running")
+        if saved and saved.get("status") in ("running", "stopping"):
+            job = JobState(
+                camera_id=str(saved.get("camera_id")),
+                truck_visit_id=saved.get("truck_visit_id"),
+                truck_product_visit_id=saved.get("truck_product_visit_id"),
+            )
+            job.status = saved.get("status")
+            job.count = int(saved.get("count") or 0)
+            job.output_path = saved.get("output_path")
+            job.video_link = saved.get("video_link")
+            job.started_at = saved.get("started_at")
+            job.last_log = "rebuilt from recovery db for stopping"
+            job.error = saved.get("error")
+            job.db_log_id = saved.get("db_log_id")
+            job.end_pressed_at = saved.get("end_pressed_at")
+            jobs[camera_id] = job
 
-            if saved_status in ("running", "stopping"):
-                rebuilt_job = JobState(
-                    camera_id=str(saved.get("camera_id")),
-                    truck_visit_id=saved.get("truck_visit_id"),
-                    truck_product_visit_id=saved.get("truck_product_visit_id"),
-                )
-                rebuilt_job.status = saved_status
-                rebuilt_job.count = int(saved.get("count") or 0)
-                rebuilt_job.output_path = saved.get("output_path")
-                rebuilt_job.video_link = saved.get("video_link")
-                rebuilt_job.started_at = saved.get("started_at")
-                rebuilt_job.last_log = "rebuilt from recovery db for stopping"
-                rebuilt_job.error = saved.get("error")
-                rebuilt_job.db_log_id = saved.get("db_log_id")
-                rebuilt_job.end_pressed_at = saved.get("end_pressed_at")
+    # 3️⃣ If job exists and running/stopping → request stop
+    if job and job.status in ("running", "stopping"):
+        with jobs_lock:
+            job.end_pressed_at = timestamp_now
+            if job.thread and job.thread.is_alive():
+                job.stop_event.set()
+            job.status = "stopping"
+            job.last_log = "stop requested via END API"
+            save_job_to_recovery(job)
 
-                with jobs_lock:
-                    jobs[camera_id] = rebuilt_job
-                    job = rebuilt_job
+        # Wait for worker to finalize + DB logging
+        job.completion_event.wait(timeout=END_CALL_WAIT_TIMEOUT_SECS)
 
-    # --------------------------------------------------
-    # 5. If no job anywhere → already stopped (idempotent success)
-    # --------------------------------------------------
-    if not job:
-        logger.info(f"[{camera_id}] END called but job already completed")
-
-        final_response = {
+    # 4️⃣ Snapshot job state (either running stopped or already completed)
+    if job:
+        snap = job_public(job)
+    else:
+        # Job not found anywhere → already stopped
+        snap = {
             "status": "completed",
             "camera_id": camera_id,
-            "object_count": 0,
+            "count": 0,
             "output_path": None,
             "video_link": None,
             "db_log_id": None,
-            "end_pressed_at": None,
+            "end_pressed_at": timestamp_now,
+            "error": None,
         }
 
-        completed_jobs_cache[job_key] = final_response
+    # 5️⃣ Always update DB
+    try:
+        if job and job.db_log_id:
+            update_video_log_end(
+                log_id=job.db_log_id,
+                output_path=snap.get("output_path"),
+                object_count=snap.get("count"),
+                video_link=snap.get("video_link"),
+                end_pressed_at_iso=snap.get("end_pressed_at"),
+                error_msg=snap.get("error")
+            )
+    except Exception:
+        logger.exception("[%s] update_video_log_end failed during END API", camera_id)
 
-        return JSONResponse(status_code=200, content=final_response)
-
-    # --------------------------------------------------
-    # 6. If job already completed → return same response
-    # --------------------------------------------------
-    if job.status not in ("running", "stopping"):
-        with jobs_lock:
-            jobs.pop(camera_id, None)
-
-        final_response = {
-            "status": job.status,
-            "camera_id": camera_id,
-            "object_count": job.count,
-            "output_path": job.output_path,
-            "video_link": job.video_link,
-            "db_log_id": job.db_log_id,
-            "end_pressed_at": job.end_pressed_at,
-        }
-
-        completed_jobs_cache[job_key] = final_response
-
-        return JSONResponse(status_code=200, content=final_response)
-
-    # --------------------------------------------------
-    # 7. Request stop
-    # --------------------------------------------------
-    with jobs_lock:
-        if not job.end_pressed_at:
-            job.end_pressed_at = datetime.utcnow().isoformat()
-
-        worker_alive = job.thread is not None and job.thread.is_alive()
-
-        if worker_alive:
-            job.stop_event.set()
-            if job.status == "running":
-                job.status = "stopping"
-            job.last_log = "stop requested, waiting for finalize+db"
-            save_job_to_recovery(job)
-
-    logger.info("[%s] API STOP requested by %s — waiting for finalize+db", camera_id, incoming_status)
-
-    # --------------------------------------------------
-    # 8. Worker not alive case
-    # --------------------------------------------------
-    if not worker_alive:
-        saved = recovery_state.get_job(camera_id)
-
-        if not saved or saved.get("status") not in ("running", "stopping"):
-            final_response = {
-                "status": "completed",
-                "camera_id": camera_id,
-                "object_count": job.count,
-                "output_path": job.output_path,
-                "video_link": job.video_link,
-                "db_log_id": job.db_log_id,
-                "end_pressed_at": job.end_pressed_at,
-            }
-
-            completed_jobs_cache[job_key] = final_response
-
-            return JSONResponse(status_code=200, content=final_response)
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": saved.get("status", job.status),
-                "warning": "Stop requested earlier; finalize/DB save in progress",
-                "camera_id": camera_id,
-                "object_count": int(saved.get("count") or job.count or 0),
-                "output_path": saved.get("output_path") or job.output_path,
-                "video_link": saved.get("video_link") or job.video_link,
-                "db_log_id": saved.get("db_log_id") or job.db_log_id,
-                "end_pressed_at": saved.get("end_pressed_at") or job.end_pressed_at,
-            },
-        )
-
-    # --------------------------------------------------
-    # 9. Wait for completion
-    # --------------------------------------------------
-    completed = job.completion_event.wait(timeout=END_CALL_WAIT_TIMEOUT_SECS)
-
-    with jobs_lock:
-        snap = job_public(job)
-
-    # --------------------------------------------------
-    # 10. Still processing
-    # --------------------------------------------------
-    if not completed:
-        logger.warning("[%s] Timeout waiting for finalize+db", camera_id)
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "stopping",
-                "warning": "Finalize/DB save still in progress",
-                "camera_id": camera_id,
-                "object_count": snap.get("count"),
-                "output_path": snap.get("output_path"),
-                "video_link": snap.get("video_link"),
-                "db_log_id": snap.get("db_log_id"),
-                "end_pressed_at": snap.get("end_pressed_at"),
-            },
-        )
-
-    # --------------------------------------------------
-    # 11. Final response
-    # --------------------------------------------------
-    final_status = snap.get("status")
-
+    # 6️⃣ Prepare final response
     final_response = {
-        "status": final_status,
+        "status": snap.get("status"),
         "camera_id": camera_id,
         "object_count": snap.get("count"),
         "output_path": snap.get("output_path"),
@@ -819,16 +747,16 @@ async def process_packmat_end(request: Request):
         "db_log_id": snap.get("db_log_id"),
         "end_pressed_at": snap.get("end_pressed_at"),
     }
-
-    # Save for idempotency
+    logger.info(f"[END API] Response: {final_response}")
+    # 7️⃣ Save response in idempotency cache (timestamped key)
     completed_jobs_cache[job_key] = final_response
 
-    if final_status in ("completed", "error"):
+    # 8️⃣ Remove completed worker from memory
+    if job and snap.get("status") in ("completed", "error"):
         with jobs_lock:
             jobs.pop(camera_id, None)
 
     return JSONResponse(status_code=200, content=final_response)
-
 
 # --------------------------------------------------
 # API: STATUS (all or one)
@@ -935,7 +863,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "index3:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
+        port=int(os.environ.get("PORT", 5005)),
         log_level="info",
     )
     
