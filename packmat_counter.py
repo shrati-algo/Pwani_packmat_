@@ -117,7 +117,7 @@ class TinyLogger:
 # Tracker
 # ---------------------------------------
 class ObjectTracker:
-    def __init__(self, iou_threshold=0.22, max_missed=5):
+    def __init__(self, iou_threshold=0.22, max_missed=10):
         self.tracks = {}
         self.iou_threshold = iou_threshold
         self.max_missed = max_missed
@@ -212,6 +212,22 @@ class VideoProcessor:
         else:
             ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             self.output_path = f"outputs/cam_{camera_id}_{ts}_output.mp4"
+                # ---------------------------------------
+        # Full video output path
+        # ---------------------------------------
+        name, ext = os.path.splitext(self.output_path)
+
+        self.full_output_path = f"{name}_full{ext}"
+
+        # ---------------------------------------
+        # Full video writer
+        # ---------------------------------------
+        self.full_writer = cv2.VideoWriter(
+            self.full_output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            self.fps,
+            self.target_size
+        )
 
         self.line_y = None
         self.logger = TinyLogger(camera_id)
@@ -279,7 +295,7 @@ class VideoProcessor:
             label = self.model.names[int(box.cls[0])]
             conf = float(box.conf[0])
 
-            if label.lower() in ["carton", "jerrycan_bundle"] and conf > 0.15:
+            if label.lower() in ["carton", "jerrycan_bundle","carton_brown","sack"] and conf > 0.15:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 detections.append(((x1, y1, x2, y2), label, conf))
 
@@ -297,6 +313,8 @@ class VideoProcessor:
 
         resized = cv2.resize(annotated, self.target_size)
         self.frame_buffer.append((time.time(), resized))
+                # Save full continuous video
+        self.full_writer.write(resized)
 
         return self.counter, self.output_path
 
@@ -317,4 +335,11 @@ class VideoProcessor:
             writer.write(f)
 
         writer.release()
+
+        # Release full video writer
+        if self.full_writer is not None:
+            self.full_writer.release()
+
+        print(f"Saved full video: {self.full_output_path}")
+
         self.logger.close()
